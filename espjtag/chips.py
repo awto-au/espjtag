@@ -274,8 +274,8 @@ CHIPS = {
                 (0x600080B0, 0x60008098, 0x00000000),   # RTC WDT
             ],
             int_clear=[],
-            swd=dict(wprotect=0x600080B4, key=0x8F1D312A,
-                     conf=0x600080B0, auto_feed=1 << 31),
+            swd=dict(wprotect=0x600080B8, key=0x8F1D312A,
+                     conf=0x600080B4, auto_feed=1 << 31),
         ),
         # scratch at the top of S3 IRAM (SOC_IRAM 0x40370000..0x403E0000, soc.h).
         sram=dict(data=0x403DC000, trap=0x403DBF00, stack=0x403DF000, top=0x403E0000),

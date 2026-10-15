@@ -53,6 +53,7 @@ MOCK_STEPS = [
     ("xtensa-regs drift (hw-free)", _s("test_xtensa_regs.py")),
     ("xtensa-cache (hw-free)", _s("test_xtensa_cache.py")),
     ("xtensa-algorithm (hw-free)", _s("test_xtensa_algorithm.py")),
+    ("s3-wdt-regs (hw-free)", _s("test_s3_wdt_regs.py")),
     ("s3-flasher (model)", _s("ocd_tcl_bridge.py", "--mock",
                               "--tcl", os.path.join(ROOT, "scripts", "test_s3_mock.tcl"))),
     ("riscv-dmi (model)", _s("test_riscv_mock.py")),
