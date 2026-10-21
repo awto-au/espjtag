@@ -87,6 +87,32 @@ class MockEspUsbJtag:
     _sbcs_value = staticmethod(_RealDM._sbcs_value)   # keep it static (see debug.py)
     read_mem32 = _RealDM.read_mem32
     write_mem32 = _RealDM.write_mem32
+    # --- RISC-V trigger module (watchpoints/breakpoints, see debug.py) ---------
+    _can_use_napot_match = staticmethod(_RealDM._can_use_napot_match)
+    _find_next_free_trigger = _RealDM._find_next_free_trigger
+    _find_first_trigger_by_id = _RealDM._find_first_trigger_by_id
+    _count_trailing_ones = staticmethod(_RealDM._count_trailing_ones)
+    _set_trigger = _RealDM._set_trigger
+    _maybe_add_trigger_t1 = _RealDM._maybe_add_trigger_t1
+    _create_wp_trigger_cache = _RealDM._create_wp_trigger_cache
+    _wp_triggers_cache_add = _RealDM._wp_triggers_cache_add
+    _wp_triggers_cache_search = _RealDM._wp_triggers_cache_search
+    _try_use_trigger_and_cache_result = _RealDM._try_use_trigger_and_cache_result
+    _try_setup_single_match_trigger = _RealDM._try_setup_single_match_trigger
+    _try_setup_chained_match_triggers = _RealDM._try_setup_chained_match_triggers
+    _fill_match_triggers_tdata1_fields_t2 = _RealDM._fill_match_triggers_tdata1_fields_t2
+    _fill_match_triggers_tdata1_fields_t6 = _RealDM._fill_match_triggers_tdata1_fields_t6
+    _maybe_add_trigger_t2_t6_for_wp = _RealDM._maybe_add_trigger_t2_t6_for_wp
+    _maybe_add_trigger_t2_t6_for_bp = _RealDM._maybe_add_trigger_t2_t6_for_bp
+    _maybe_add_trigger_t2_t6 = _RealDM._maybe_add_trigger_t2_t6
+    _check_if_trigger_exists = _RealDM._check_if_trigger_exists
+    _get_trigger_types = _RealDM._get_trigger_types
+    _disable_trigger_if_dmode = _RealDM._disable_trigger_if_dmode
+    _enumerate_triggers = _RealDM._enumerate_triggers
+    _add_trigger = _RealDM._add_trigger
+    add_watchpoint = _RealDM.add_watchpoint
+    add_breakpoint = _RealDM.add_breakpoint
+    remove_watchpoint = _RealDM.remove_watchpoint
     del _RealDM
 
 

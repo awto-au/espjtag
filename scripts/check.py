@@ -57,6 +57,7 @@ MOCK_STEPS = [
     ("s3-flasher (model)", _s("ocd_tcl_bridge.py", "--mock",
                               "--tcl", os.path.join(ROOT, "scripts", "test_s3_mock.tcl"))),
     ("riscv-dmi (model)", _s("test_riscv_mock.py")),
+    ("riscv-triggers (hw-free)", _s("test_riscv_triggers.py")),
 ]
 REAL_STEPS = [
     ("selftest+dmireset C6", _s("validate_dmireset.py", "--usb-path", C6_USB)),
