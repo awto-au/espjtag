@@ -6,8 +6,11 @@ docs/FAITHFUL-REIMPLEMENTATION.md for the porting discipline this follows.
 
 Covers: trigger enumeration against a mock hart, find_next_free_trigger,
 set_trigger's full disable/write/verify DMI sequence (accept + reject paths),
-and a full add_watchpoint() composing a real mcontrol6 equality-match tdata1
-value checked against a hand-computed expected value.
+a full add_watchpoint() composing a real mcontrol6 equality-match tdata1 value
+checked against a hand-computed expected value, and the #57 step-over-trigger
+fix (step(), hit-bit detection, and resume()'s disable/step/re-arm sequence —
+ported from riscv.c resume_prep/riscv_openocd_step_impl + riscv-013.c
+set_dcsr_config/riscv013_step_or_resume_current_hart, same pinned SHA).
 
 Run by check.py --mock. Exit 1 on any mismatch.
 """
@@ -19,8 +22,9 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from espjtag.mock import MockEspUsbJtag                            # noqa: E402
 from espjtag.debug import EspUsbJtag, ERROR_OK                      # noqa: E402
 from espjtag.constants import (                                     # noqa: E402
-    DMSTATUS, DM_ALLHALTED,
-    CSR_TSELECT, CSR_TDATA1, CSR_TDATA2, CSR_TINFO, CSR_MISA,
+    DMCONTROL, DMSTATUS, DM_ALLHALTED, DM_ALLRUNNING, DM_ALLRESUMEACK,
+    DM_DMACTIVE, DM_RESUMEREQ, DM_HALTREQ,
+    CSR_TSELECT, CSR_TDATA1, CSR_TDATA2, CSR_TINFO, CSR_MISA, CSR_DCSR,
     CSR_TDATA1_TYPE_MCONTROL6, CSR_TDATA1_TYPE_MASK, CSR_TDATA1_TYPE_OFFSET,
     CSR_MCONTROL6_DMODE_MASK, CSR_MCONTROL6_ACTION_MASK,
     CSR_MCONTROL6_ACTION_DEBUG_MODE, CSR_MCONTROL6_M_MASK,
@@ -28,6 +32,9 @@ from espjtag.constants import (                                     # noqa: E402
     CSR_MCONTROL6_CHAIN_MASK, CSR_MCONTROL6_CHAIN_DISABLED,
     CSR_MCONTROL6_MATCH_MASK, CSR_MCONTROL6_MATCH_EQUAL, CSR_MCONTROL6_SIZE_MASK,
     CSR_MCONTROL6_SIZE_ANY, CSR_MCONTROL6_TYPE_MASK, CSR_MCONTROL6_TYPE_OFFSET,
+    CSR_MCONTROL6_HIT0_MASK, CSR_MCONTROL6_HIT1_MASK, CSR_MCONTROL6_HIT0_BEFORE,
+    CSR_DCSR_STEP, CSR_DCSR_CAUSE_MASK, CSR_DCSR_CAUSE_TRIGGER,
+    CSR_TINFO_VERSION_1,
 )
 
 _fail = 0
@@ -373,6 +380,172 @@ def test_add_watchpoint_raises_when_no_free_trigger():
     check("add_watchpoint raises RuntimeError when no trigger is available", raised, True)
 
 
+# =============================================================================
+# #57 step-over-trigger: resume() after a watchpoint hit re-fires forever
+# =============================================================================
+
+def _arm_one_mcontrol6_watchpoint(j, addr=0x600A1FF0):
+    """Shared setup: enumerate a single type-6 trigger and add a store
+    watchpoint on it, mirroring the #57 repro (0x600A1FF0, is_write=True)."""
+    j.csrs[CSR_TDATA1] = 0
+    EspUsbJtag._enumerate_triggers(j)
+    j.wp_allow_napot_trigger = False
+    j.wp_allow_ge_lt_trigger = False
+    handle = j.add_watchpoint(addr, length=4, is_read=False, is_write=True)
+    return handle
+
+
+def test_step_sets_and_clears_dcsr_step():
+    """step() (riscv-013.c set_dcsr_config + riscv013_step_or_resume_current_
+    hart, step=True): dcsr.step set before the resumereq handshake, the
+    handshake waits for BOTH allresumeack and allhalted (a step halts again
+    immediately), and dcsr.step is cleared again afterwards -- the hart must
+    never be left in permanent single-step mode."""
+    from espjtag.constants import DATA0
+    j = MockEspUsbJtag()
+    j.set_dm(DATA0, 0)                                    # initial dcsr read == 0
+    j.set_dm(DMSTATUS, DM_ALLRESUMEACK | DM_ALLHALTED)    # step completes on try 1
+    ok = j.step()
+    check("step() reports success", ok, True)
+    data0_writes = [v for a, v in j.dmi_writes if a == DATA0]
+    check("dcsr.step was asserted at some point (a write had the STEP bit set)",
+          any(v & CSR_DCSR_STEP for v in data0_writes), True)
+    check("dcsr.step left clear by the FINAL write (never left stuck in step mode)",
+          data0_writes[-1] & CSR_DCSR_STEP, 0)
+    dmcontrol_writes = [v for a, v in j.dmi_writes if a == DMCONTROL]
+    check("step() issued resumereq then dropped it (DMCONTROL sequence)",
+          dmcontrol_writes, [DM_RESUMEREQ | DM_DMACTIVE, DM_DMACTIVE])
+
+
+def test_step_fails_if_hart_never_rehalts():
+    """step() must report failure (not hang forever) if dmstatus never shows
+    allhalted after resumereq -- mirrors riscv013_step_or_resume_current_hart's
+    own bounded retry loop (riscv.c:5667, `for (i = 0; i < 256; ++i)`)."""
+    from espjtag.constants import DATA0
+    j = MockEspUsbJtag()
+    j.set_dm(DATA0, 0)
+    j.set_dm(DMSTATUS, DM_ALLRESUMEACK)        # resumeack but NEVER halted again
+    ok = j.step()
+    check("step() reports failure when the hart never re-halts", ok, False)
+    data0_writes = [v for a, v in j.dmi_writes if a == DATA0]
+    check("dcsr.step still cleared on the failure path (never left stuck)",
+          data0_writes[-1] & CSR_DCSR_STEP, 0)
+
+
+def test_detect_hit_bits_before_timing_needs_step():
+    """_riscv_trigger_detect_hit_bits (riscv.c:1904): a type-6 trigger with
+    hit0/hit1 == BEFORE must report need_single_step=True and CLEAR the hit
+    bits on readback -- the exact condition that makes bare resume() re-fire
+    forever (#57 root cause) when nothing acts on it."""
+    j = CsrMockJtag(idcode=0x0000DC25, trigger_tinfo={0: 1 << 6}, tselect_clamp=0)
+    handle = _arm_one_mcontrol6_watchpoint(j)
+    j.tinfo_version = CSR_TINFO_VERSION_1
+    # Simulate the hardware firing: OR the BEFORE hit pattern into the live tdata1.
+    j.csrs[CSR_TDATA1] |= (CSR_MCONTROL6_HIT0_BEFORE << 0x16)  # hit0 offset
+    unique_id, need_step = EspUsbJtag._riscv_trigger_detect_hit_bits(j)
+    check("detected the trigger that hit", unique_id, handle)
+    check("BEFORE timing -> need_single_step", need_step, True)
+    check("hit bits cleared after detection",
+          j.csrs[CSR_TDATA1] & (CSR_MCONTROL6_HIT0_MASK | CSR_MCONTROL6_HIT1_MASK), 0)
+
+
+def test_halt_then_bare_resume_would_refire_without_the_fix():
+    """Demonstrates the #57 bug class directly: after a trigger-cause halt with
+    a BEFORE-timing hit, the trigger's tdata1/tdata2 are UNCHANGED (still armed,
+    still matching the same address) unless something disables+steps+re-arms
+    it. This proves the precondition the fix must act on -- if resume() did
+    nothing extra, the exact same tdata1/tdata2 that just matched would still
+    be live when the hart resumes at the identical (unretired) PC, so hardware
+    re-traps immediately. (We don't model instruction retirement in the mock;
+    the point is the trigger STATE that forces the re-fire is reproduced, which
+    is what _step_over_trigger_if_needed's disable/step/re-arm is for.)"""
+    j = CsrMockJtag(idcode=0x0000DC25, trigger_tinfo={0: 1 << 6}, tselect_clamp=0)
+    handle = _arm_one_mcontrol6_watchpoint(j)
+    tdata1_armed, tdata2_armed = j.csrs[CSR_TDATA1], j.csrs[CSR_TDATA2]
+    j.tinfo_version = CSR_TINFO_VERSION_1
+    j.set_dm(DMSTATUS, DM_ALLHALTED)
+    j.csrs[CSR_DCSR] = CSR_DCSR_CAUSE_TRIGGER << 6     # dcsr.cause = trigger
+    j.csrs[CSR_TDATA1] |= (CSR_MCONTROL6_HIT0_BEFORE << 0x16)
+    EspUsbJtag._note_trigger_hit_for_step_over(j)
+    pending = j._pending_step_over
+    check("halt() recorded a pending step-over for the hit trigger",
+          pending[0] if pending else None, handle)
+    check("the recorded trigger config is exactly what was armed (so re-arm is faithful)",
+          pending[1], [(0, tdata1_armed, tdata2_armed)])
+
+
+def test_resume_disables_steps_and_rearms_the_hit_trigger():
+    """THE fix, end to end: resume() after a recorded step-over pending must
+    (1) clear the hit trigger's tdata1 (disable_watchpoints), (2) step() once
+    (riscv_step_rtos_hart), (3) re-arm the EXACT original tdata1/tdata2
+    (enable_watchpoints), (4) THEN do the normal dmcontrol resumereq resume.
+    Checked via the TSELECT/TDATA1 write order, not just end state, since
+    ordering is the load-bearing part (OpenOCD does disable-step-rearm BEFORE
+    the real resume, never after)."""
+    j = CsrMockJtag(idcode=0x0000DC25, trigger_tinfo={0: 1 << 6}, tselect_clamp=0)
+    handle = _arm_one_mcontrol6_watchpoint(j)
+    tdata1_armed, tdata2_armed = j.csrs[CSR_TDATA1], j.csrs[CSR_TDATA2]
+    j._pending_step_over = (handle, [(0, tdata1_armed, tdata2_armed)])
+    # step()'s internal poll (200 tries) sees ALLRESUMEACK|ALLHALTED (the step
+    # completed) for as many reads as it takes; resume()'s OWN poll afterwards
+    # needs ALLRUNNING instead (the real resume actually ran the hart) — model
+    # both with a long scripted sequence: plenty of "step done" reads, then
+    # "running" reads for the real resume's own poll.
+    j.set_dm_sequence(DMSTATUS,
+                      [DM_ALLRESUMEACK | DM_ALLHALTED] * 4 + [DM_ALLRUNNING] * 4)
+
+    ok = j.resume()
+    check("resume() succeeds", ok, True)
+    check("pending step-over consumed (won't re-apply on the NEXT resume)",
+          j._pending_step_over, None)
+    check("the hit trigger ends re-armed with its ORIGINAL tdata1",
+          j.csrs[CSR_TDATA1], tdata1_armed)
+    check("the hit trigger ends re-armed with its ORIGINAL tdata2",
+          j.csrs[CSR_TDATA2], tdata2_armed)
+
+    # Ordering: CsrMockJtag.write_register logs to j.ops (not dmi_writes/DATA0 —
+    # see its docstring). tdata1 must be written 0 (disable) strictly BEFORE it
+    # is written back to tdata1_armed (re-arm) — proves disable happens before
+    # re-arm, not the other way round.
+    tdata1_writes = [v for op in j.ops if op[0] == "write_register"
+                     and op[1] == CSR_TDATA1 for v in (op[2],)]
+    first_rearm_idx = tdata1_writes.index(tdata1_armed)
+    zero_before_rearm = [i for i, v in enumerate(tdata1_writes)
+                         if v == 0 and i < first_rearm_idx]
+    check("a TDATA1=0 (disable) write occurred before the re-arm write",
+          len(zero_before_rearm) > 0, True)
+    # resume()'s own resumereq must come AFTER the step-over's resumereq (the
+    # step's resumereq is issued, cleared, then the real resume issues its own).
+    dmcontrol_writes = [v for a, v in j.dmi_writes if a == DMCONTROL]
+    check("TWO resumereq cycles happened (one for step(), one for the real resume)",
+          dmcontrol_writes.count(DM_RESUMEREQ | DM_DMACTIVE), 2)
+
+
+def test_resume_is_a_noop_passthrough_without_a_pending_hit():
+    """The common case (resume after halt(), ebreak, or haltreq -- no trigger
+    hit pending) must NOT be touched by #57's fix: no extra TSELECT/TDATA1
+    churn, straight to the normal resumereq handshake."""
+    j = MockEspUsbJtag()
+    j.set_dm(DMSTATUS, DM_ALLRUNNING)
+    ok = j.resume()
+    check("resume() with no pending step-over succeeds normally", ok, True)
+    dmcontrol_writes = [v for a, v in j.dmi_writes if a == DMCONTROL]
+    check("exactly ONE resumereq cycle (no step() was invoked)",
+          dmcontrol_writes, [DM_RESUMEREQ | DM_DMACTIVE, DM_DMACTIVE])
+
+
+def test_halt_does_not_record_pending_step_for_non_trigger_causes():
+    """_note_trigger_hit_for_step_over must be a no-op for ebreak/haltreq/step
+    causes (dcsr.cause != TRIGGER) -- only a genuine trigger hit schedules a
+    step-over, matching set_debug_reason's own cause switch (riscv.c:2647)."""
+    j = CsrMockJtag(idcode=0x0000DC25, trigger_tinfo={0: 1 << 6}, tselect_clamp=0)
+    _arm_one_mcontrol6_watchpoint(j)
+    j.csrs[CSR_DCSR] = 3 << 6          # dcsr.cause = haltreq, NOT trigger
+    EspUsbJtag._note_trigger_hit_for_step_over(j)
+    check("no pending step-over recorded for a haltreq-caused halt",
+          getattr(j, "_pending_step_over", None), None)
+
+
 def main():
     print("=== RISC-V trigger module — NO-HARDWARE (software model) ===")
     test_can_use_napot_match()
@@ -388,6 +561,14 @@ def main():
     test_add_watchpoint_napot_range()
     test_add_watchpoint_chained_ge_lt_range()
     test_add_watchpoint_raises_when_no_free_trigger()
+    print("  --- #57 step-over-trigger ---")
+    test_step_sets_and_clears_dcsr_step()
+    test_step_fails_if_hart_never_rehalts()
+    test_detect_hit_bits_before_timing_needs_step()
+    test_halt_then_bare_resume_would_refire_without_the_fix()
+    test_resume_disables_steps_and_rearms_the_hit_trigger()
+    test_resume_is_a_noop_passthrough_without_a_pending_hit()
+    test_halt_does_not_record_pending_step_for_non_trigger_causes()
     print("  (no hardware was touched)")
     print("VERDICT:", "PASS" if not _fail else "FAIL")
     return 1 if _fail else 0

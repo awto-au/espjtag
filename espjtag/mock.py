@@ -113,6 +113,12 @@ class MockEspUsbJtag:
     add_watchpoint = _RealDM.add_watchpoint
     add_breakpoint = _RealDM.add_breakpoint
     remove_watchpoint = _RealDM.remove_watchpoint
+    # --- step-over-trigger (#57: resume() after a watchpoint hit) -------------
+    step = _RealDM.step
+    _check_mcontrol6_hit_status = _RealDM._check_mcontrol6_hit_status
+    _riscv_trigger_detect_hit_bits = _RealDM._riscv_trigger_detect_hit_bits
+    _step_over_trigger_if_needed = _RealDM._step_over_trigger_if_needed
+    _note_trigger_hit_for_step_over = _RealDM._note_trigger_hit_for_step_over
     del _RealDM
 
 
