@@ -30,6 +30,11 @@ from .constants import (
     CMD_ACCESS_REGISTER, AC_TRANSFER, AC_WRITE, AC_AARSIZE32, AC_POSTEXEC,
     CSR_DCSR, CSR_DPC, CSR_MSTATUS, MSTATUS_MIE, REG_GPR_BASE, PROGBUF0,
     DCSR_EBREAK_BITS, EBREAK,
+    CSR_DCSR_STEP, CSR_DCSR_CAUSE_MASK, CSR_DCSR_CAUSE_TRIGGER,
+    CSR_TINFO_VERSION_0, CSR_TINFO_VERSION_1,
+    CSR_MCONTROL_HIT_MASK, CSR_MCONTROL6_HIT0_MASK, CSR_MCONTROL6_HIT1_MASK,
+    CSR_MCONTROL6_HIT0_FALSE, CSR_MCONTROL6_HIT0_BEFORE,
+    CSR_MCONTROL6_HIT0_AFTER, CSR_MCONTROL6_HIT0_IMMEDIATELY_AFTER,
     CSR_MISA, MISA_EXT_S, MISA_EXT_U, MISA_EXT_H, XLEN,
     CSR_TSELECT, CSR_TDATA1, CSR_TDATA2, CSR_TINFO,
     CSR_TDATA1_TYPE_MASK,
@@ -124,6 +129,10 @@ class EspUsbJtag(EspUsbJtagTransport):
                 self.dmi_write(DMCONTROL, DM_DMACTIVE)     # drop haltreq
                 if disable_wdt:
                     self._wdt_disable()
+                # #57 step-over-trigger: record whether this halt was a
+                # "before"-timing watchpoint hit, so the next resume() knows to
+                # step past it first (set_debug_reason, riscv.c:2642).
+                self._note_trigger_hit_for_step_over()
                 return True
         return False
 
@@ -142,6 +151,11 @@ class EspUsbJtag(EspUsbJtagTransport):
             self.write_mem32(reg, val)             # clear pending WDT int state
 
     def resume(self, timeout=200):
+        # #57 step-over-trigger (resume_prep, riscv.c:2916): if the last halt
+        # was a "before"-timing watchpoint hit, disable it, step past the
+        # watched instruction, and re-arm it before the real resume below —
+        # otherwise this resume just re-fires at the identical PC forever.
+        self._step_over_trigger_if_needed()
         self.dmi_write(DMCONTROL, DM_RESUMEREQ | DM_DMACTIVE)
         for _ in range(timeout):
             if self.dm_read(DMSTATUS) & DM_ALLRUNNING:
@@ -1197,6 +1211,211 @@ class EspUsbJtag(EspUsbJtagTransport):
                 self.trigger_unique_id[idx] = -1
                 cleared += 1
         return cleared
+
+    # --- step-over-trigger (#57): resume() after a watchpoint hit ----------
+    # RISC-V triggers default to "before" timing: the trigger fires BEFORE the
+    # matched instruction commits, so bare resume() re-fires at the identical
+    # PC forever. OpenOCD's fix (riscv.c resume_prep + riscv_openocd_step_impl,
+    # ported below) is: on halt, inspect the hit trigger's timing
+    # (riscv_trigger_detect_hit_bits); if it needs a step, resume() first
+    # disables that one trigger, single-steps past the instruction (dcsr.step),
+    # re-arms the trigger, THEN does the real resume. Scoped to mcontrol/
+    # mcontrol6 (types 2/6, the only ones this port's add_trigger ever sets,
+    # per the class-level scope note above _can_use_napot_match) — icount/i/e
+    # trigger (types 3/4/5) hit-bit handling (riscv.c:1956-1964) is out of
+    # scope, matching the rest of #trigger-port.
+
+    def _check_mcontrol6_hit_status(self, tdata1, hit_mask):
+        """check_mcontrol6_hit_status (riscv.c:1855). hit_mask is HIT0|HIT1.
+        Returns one of M6_HIT_{NOT_SUPPORTED,NOT_HIT,BEFORE,AFTER,IMM_AFTER}
+        (module-level string sentinels — see ERROR_OK et al above for why
+        espjtag uses Python sentinels instead of OpenOCD's C enum ints)."""
+        hit0 = _get_field(tdata1, CSR_MCONTROL6_HIT0_MASK)
+        hit1 = _get_field(tdata1, CSR_MCONTROL6_HIT1_MASK)
+        hit_info = (hit1 << 1) | hit0
+        if hit_info == CSR_MCONTROL6_HIT0_BEFORE:
+            return "M6_HIT_BEFORE"
+        if hit_info == CSR_MCONTROL6_HIT0_AFTER:
+            return "M6_HIT_AFTER"
+        if hit_info == CSR_MCONTROL6_HIT0_IMMEDIATELY_AFTER:
+            return "M6_HIT_IMM_AFTER"
+        if hit_info == CSR_MCONTROL6_HIT0_FALSE:
+            # hit[1..0] == 0: either "hit bits supported, not fired" or "hit
+            # bits not implemented". Probe by writing every non-zero pattern
+            # to hit[1:0] and reading back; if none sticks, hit bits aren't
+            # implemented (riscv.c:1876-1894).
+            tdata1_tests = [
+                _set_field(tdata1, CSR_MCONTROL6_HIT0_MASK, 1),
+                _set_field(tdata1, CSR_MCONTROL6_HIT1_MASK, 1),
+                _set_field(tdata1, CSR_MCONTROL6_HIT0_MASK, 1) |
+                _field_value(CSR_MCONTROL6_HIT1_MASK, 1),
+            ]
+            for test in tdata1_tests:
+                try:
+                    self.write_register(CSR_TDATA1, test)
+                    test_rb = self.read_register(CSR_TDATA1)
+                except RuntimeError:
+                    return "M6_HIT_ERROR"
+                if test_rb == test:
+                    try:
+                        self.write_register(CSR_TDATA1, test_rb & ~hit_mask)
+                    except RuntimeError:
+                        return "M6_HIT_ERROR"
+                    return "M6_NOT_HIT"
+            return "M6_HIT_NOT_SUPPORTED"
+        return "M6_HIT_NOT_SUPPORTED"
+
+    def _riscv_trigger_detect_hit_bits(self):
+        """riscv_trigger_detect_hit_bits (riscv.c:1904). Scan every ARMED
+        trigger (trigger_unique_id[i] != -1) for its hit bit; clear the hit bit
+        (W1C-by-convention: write back tdata1 with it cleared) on the one that
+        fired. Returns (unique_id, need_single_step) — unique_id is None if no
+        hit bit was found (RISCV_TRIGGER_HIT_NOT_FOUND).
+
+        DEVIATION (documented): type 3/4/5 (icount/itrigger/etrigger) hit-bit
+        handling (riscv.c:1956-1964) is omitted — out of #trigger-port's scope,
+        same as everywhere else those types are skipped in this file. A hart
+        reporting one of those types here just falls through with hit_mask=0,
+        same as the LEGACY (type 1) case upstream."""
+        if not getattr(self, "triggers_enumerated", False):
+            return None, False
+        tselect = self.read_register(CSR_TSELECT)
+
+        unique_id = None
+        need_single_step = False
+        for i in range(self.trigger_count):
+            if self.trigger_unique_id[i] == -1:
+                continue
+            self.write_register(CSR_TSELECT, i)
+            tdata1 = self.read_register(CSR_TDATA1)
+            type_ = _get_field(tdata1, CSR_TDATA1_TYPE_MASK)
+
+            hit_mask = 0
+            if type_ == CSR_TDATA1_TYPE_LEGACY:
+                pass                                    # doesn't support hit bit
+            elif type_ == CSR_TDATA1_TYPE_MCONTROL:
+                hit_mask = CSR_MCONTROL_HIT_MASK
+                need_single_step = True
+            elif type_ == CSR_TDATA1_TYPE_MCONTROL6:
+                hit_mask = CSR_MCONTROL6_HIT0_MASK | CSR_MCONTROL6_HIT1_MASK
+                if self.tinfo_version == CSR_TINFO_VERSION_0:
+                    need_single_step = True
+                elif self.tinfo_version in (None, CSR_TINFO_VERSION_1):
+                    status = self._check_mcontrol6_hit_status(tdata1, hit_mask)
+                    if status == "M6_HIT_ERROR":
+                        raise RuntimeError(
+                            "_riscv_trigger_detect_hit_bits: mcontrol6 hit-bit "
+                            "probe failed")
+                    if status in ("M6_HIT_BEFORE", "M6_HIT_NOT_SUPPORTED"):
+                        need_single_step = True
+
+            if tdata1 & hit_mask:
+                self.write_register(CSR_TDATA1, tdata1 & ~hit_mask)
+                unique_id = self.trigger_unique_id[i]
+                break
+
+        self.write_register(CSR_TSELECT, tselect)
+        return unique_id, need_single_step
+
+    def step(self):
+        """Single-step the current hart one instruction (dcsr.step). Ported
+        from openocd-esp32 src/target/riscv/riscv-013.c @
+        a585825d4d0bbd5b8aff83e01816d2f2c04ffd84 set_dcsr_config (:1756, step
+        bit only — the ebreak*/cetrig fields it also writes are set once at
+        reset-run time, not per-step, see DCSR_EBREAK_BITS/call_function above)
+        + riscv013_step_or_resume_current_hart(step=True) (:5638): set
+        dcsr.step=1, issue the SAME resumereq handshake as resume(), but wait
+        for ALLHALTED too (a step halts again immediately) before dropping
+        resumereq. The hart MUST be halted first. Returns True on success.
+
+        DEVIATION (documented): upstream clears dcsr.step at the START of the
+        NEXT resume/step (riscv.c resume_prep:2949 -> riscv013_resume_prep:5486
+        -> riscv013_on_step_or_resume(step=False):5624 -> set_dcsr_config,
+        the SAME function this step() ports FROM, called with step=False) —
+        never by the step operation itself. espjtag's step() clears it
+        immediately after its own resumereq handshake instead, since
+        espjtag's resume() has no separate prep/go split to hang a pre-resume
+        dcsr-clear off of. Net effect on the wire is identical either way
+        (dcsr.step=0 before the hart is ever let run freely); this only moves
+        WHEN the clearing write happens, not whether it happens."""
+        dcsr = self.read_register(CSR_DCSR)
+        self.write_register(CSR_DCSR, dcsr | CSR_DCSR_STEP)
+        self.dmi_write(DMCONTROL, DM_RESUMEREQ | DM_DMACTIVE)
+        ok = False
+        for _ in range(200):
+            st = self.dm_read(DMSTATUS)
+            if not (st & DM_ALLRESUMEACK):
+                continue
+            if st & DM_ALLHALTED:
+                ok = True
+                break
+        self.dmi_write(DMCONTROL, DM_DMACTIVE)             # resumereq <- 0
+        # restore dcsr.step regardless of outcome — never leave the hart
+        # permanently in single-step mode.
+        self.write_register(CSR_DCSR, dcsr & ~CSR_DCSR_STEP)
+        return ok
+
+    def _step_over_trigger_if_needed(self):
+        """resume_prep's watchpoint-timing check (riscv.c:2916, the
+        `target->debug_reason == DBG_REASON_WATCHPOINT && r->need_single_step`
+        branch) + riscv_openocd_step_impl's disable/step/re-enable sequence
+        (riscv.c:4283, disable_watchpoints/riscv_step_rtos_hart/
+        enable_watchpoints — scoped here to the SINGLE trigger that hit,
+        mirroring OpenOCD's per-watchpoint disable_watchpoints loop since
+        espjtag has no watchpoint linked-list to walk wholesale).
+
+        Call this at the START of resume(). No-op unless the previous halt was
+        a trigger hit that needs single-step (self._pending_step_over set by
+        halt()'s hit-bit scan below)."""
+        pending = getattr(self, "_pending_step_over", None)
+        self._pending_step_over = None
+        if pending is None:
+            return
+        handle, saved = pending
+        # disable_watchpoints: clear just this trigger's tdata1/tdata2 (riscv.c:2867)
+        for idx, tdata1, tdata2 in saved:
+            self._set_trigger(idx, 0, 0)
+        # riscv_step_rtos_hart (riscv.c:6185): single-step past the instruction
+        if not self.step():
+            raise RuntimeError(
+                f"_step_over_trigger_if_needed: step past watchpoint handle "
+                f"{handle} failed (hart did not re-halt)")
+        # enable_watchpoints: re-arm with the EXACT tdata1/tdata2 that was
+        # cleared (riscv.c:2894) -- not re-running add_trigger's search, since
+        # the trigger index + config are already known good.
+        for idx, tdata1, tdata2 in saved:
+            ret = self._set_trigger(idx, tdata1, tdata2)
+            if ret != ERROR_OK:
+                raise RuntimeError(
+                    f"_step_over_trigger_if_needed: failed to re-arm trigger "
+                    f"{idx} for handle {handle} after step (ret={ret})")
+
+    def _note_trigger_hit_for_step_over(self):
+        """Call this right after a successful halt() while the hit trigger's
+        tdata1/tdata2 are still live, so the NEXT resume() knows whether to
+        step over it first. Not a literal upstream function — OpenOCD does
+        this inline in set_debug_reason() at every poll; espjtag has no poll
+        loop, so halt() calls this once, synchronously, right after it
+        confirms ALLHALTED (riscv.c:2642-2690 set_debug_reason, scoped to the
+        trigger-cause/watchpoint path only — ebreak/haltreq/step causes need no
+        step-over and are left alone, same as upstream's DBG_REASON_BREAKPOINT/
+        other branches)."""
+        if not getattr(self, "triggers_enumerated", False):
+            return
+        dcsr = self.read_register(CSR_DCSR)
+        if _get_field(dcsr, CSR_DCSR_CAUSE_MASK) != CSR_DCSR_CAUSE_TRIGGER:
+            return
+        unique_id, need_single_step = self._riscv_trigger_detect_hit_bits()
+        if unique_id is None or not need_single_step:
+            return
+        saved = []
+        for idx in range(self.trigger_count):
+            if self.trigger_unique_id[idx] == unique_id:
+                self.write_register(CSR_TSELECT, idx)
+                tdata1 = self.read_register(CSR_TDATA1)
+                tdata2 = self.read_register(CSR_TDATA2)
+                saved.append((idx, tdata1, tdata2))
+        self._pending_step_over = (unique_id, saved)
 
     def call_rom(self, sym, args=(), restore=True):
         """Call a named ROM function from this chip's chips.rom table (e.g.

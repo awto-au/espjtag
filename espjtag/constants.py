@@ -109,6 +109,19 @@ DCSR_EBREAKU = 1 << 12                   # 0x1000
 DCSR_EBREAKM = 1 << 15                   # 0x8000
 DCSR_EBREAK_BITS = DCSR_EBREAKM | DCSR_EBREAKU   # -> turns 0xc3 into 0x90c3
 
+# dcsr.step / dcsr.cause (debug_defines.h:513-470, step-over-trigger port #57).
+# CAUSE is read-only; hardware reports WHY the hart is in debug mode (ebreak=1,
+# trigger=2, haltreq=3, step=4, resethaltreq=5, group=6, other=7).
+CSR_DCSR_STEP_OFFSET = 2
+CSR_DCSR_STEP = 1 << CSR_DCSR_STEP_OFFSET                     # 0x4
+CSR_DCSR_CAUSE_OFFSET = 6
+CSR_DCSR_CAUSE_MASK = 0x7 << CSR_DCSR_CAUSE_OFFSET            # 0x1c0
+CSR_DCSR_CAUSE_EBREAK = 1
+CSR_DCSR_CAUSE_TRIGGER = 2
+CSR_DCSR_CAUSE_HALTREQ = 3
+CSR_DCSR_CAUSE_STEP = 4
+CSR_DCSR_CAUSE_RESETHALTREQ = 5
+
 # Standard RISC-V privileged-spec CSR (not Debug Module); not in debug_defines.h
 # (that file only has the Debug Module's own registers). Same provenance class
 # as CSR_MSTATUS above: a fixed, well-known CSR number, not sourced from
@@ -156,6 +169,12 @@ CSR_TDATA1_TYPE_DISABLED = 15
 CSR_TINFO_VERSION_OFFSET = 0x18
 CSR_TINFO_VERSION_MASK = 0xFF000000
 CSR_TINFO_INFO_MASK = 0xFFFF            # trigger-type-support bitmask, bit N = type N
+# tinfo.version values (debug_defines.h:663,668) -- step-over-trigger port (#57):
+# version 0 means "hit bits exist but their before/after timing is unknown",
+# version 1 means "hit[1:0] encodes before/after/immediately-after" (debug_defines.h
+# CSR_MCONTROL6_HIT0_{BEFORE,AFTER,IMMEDIATELY_AFTER} below).
+CSR_TINFO_VERSION_0 = 0
+CSR_TINFO_VERSION_1 = 1
 
 # mcontrol (type 2, legacy match trigger) fields at XLEN=32 (debug_defines.h:742-1100)
 CSR_MCONTROL_TYPE_OFFSET = XLEN - 4                          # 28 (:743)
@@ -194,6 +213,11 @@ CSR_MCONTROL_STORE_OFFSET = 1                                # (:1091-1093)
 CSR_MCONTROL_STORE_MASK = 0x2
 CSR_MCONTROL_LOAD_OFFSET = 0                                 # (:1098-1100)
 CSR_MCONTROL_LOAD_MASK = 0x1
+# mcontrol.hit (debug_defines.h:779) -- step-over-trigger port (#57): set by
+# hardware when this trigger fired; always "before" timing (no hit0/hit1 pair
+# like mcontrol6), so a type-2 hit always needs the step-over-and-rearm dance.
+CSR_MCONTROL_HIT_OFFSET = 0x14
+CSR_MCONTROL_HIT_MASK = 0x100000
 
 # mcontrol6 (type 6, what C3/C5/C6 actually report) fields at XLEN=32
 # (debug_defines.h:1101-1462). NOTE (#trigger-port): MATCH_OFFSET=7 (4 bits,
@@ -235,3 +259,18 @@ CSR_MCONTROL6_STORE_OFFSET = 1                               # (:1453-1455)
 CSR_MCONTROL6_STORE_MASK = 0x2
 CSR_MCONTROL6_LOAD_OFFSET = 0                                # (:1460-1462)
 CSR_MCONTROL6_LOAD_MASK = 0x1
+# mcontrol6.hit0/hit1 (debug_defines.h:1126-1190) -- step-over-trigger port
+# (#57): combine into a 2-bit field (hit1<<1|hit0) reporting WHEN the trigger
+# fired relative to the matched instruction. BEFORE means the watched memory
+# access has NOT committed yet -- resuming without stepping past it re-fires
+# at the identical PC forever (riscv.c check_mcontrol6_hit_status/
+# riscv_trigger_detect_hit_bits, ported below as _check_mcontrol6_hit_status/
+# _riscv_trigger_detect_hit_bits).
+CSR_MCONTROL6_HIT0_OFFSET = 0x16
+CSR_MCONTROL6_HIT0_MASK = 0x400000
+CSR_MCONTROL6_HIT1_OFFSET = 0x19
+CSR_MCONTROL6_HIT1_MASK = 0x2000000
+CSR_MCONTROL6_HIT0_FALSE = 0
+CSR_MCONTROL6_HIT0_BEFORE = 1
+CSR_MCONTROL6_HIT0_AFTER = 2
+CSR_MCONTROL6_HIT0_IMMEDIATELY_AFTER = 3
