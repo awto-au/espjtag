@@ -114,9 +114,12 @@ from .xtensa_regs import (                          # noqa: E402,F401
     XT_REG_IDX_PC, XT_REG_IDX_AR0, XT_REG_IDX_ARFIRST, XT_REG_IDX_AR3,
     XT_REG_IDX_AR15, XT_REG_IDX_ARLAST, XT_REG_IDX_WINDOWBASE,
     XT_REG_IDX_WINDOWSTART, XT_REG_IDX_PS, XT_REG_IDX_IBREAKENABLE,
-    XT_REG_IDX_DDR, XT_REG_IDX_IBREAKA0, XT_REG_IDX_CPENABLE, XT_REG_IDX_EXCCAUSE,
+    XT_REG_IDX_DDR, XT_REG_IDX_IBREAKA0, XT_REG_IDX_IBREAKA1,
+    XT_REG_IDX_CPENABLE, XT_REG_IDX_EXCCAUSE,
     XT_REG_IDX_DEBUGCAUSE, XT_REG_IDX_ICOUNT, XT_REG_IDX_ICOUNTLEVEL,
-    XT_REG_IDX_DBREAKC0, XT_REG_IDX_A0, XT_REG_IDX_A3, XT_REG_IDX_A15, XT_NUM_REGS,
+    XT_REG_IDX_DBREAKA0, XT_REG_IDX_DBREAKA1,
+    XT_REG_IDX_DBREAKC0, XT_REG_IDX_DBREAKC1,
+    XT_REG_IDX_A0, XT_REG_IDX_A3, XT_REG_IDX_A15, XT_NUM_REGS,
     XT_REG_GENERAL, XT_REG_USER, XT_REG_SPECIAL, XT_REG_DEBUG, XT_REG_RELGEN,
     XT_REG_FR, XT_REG_TIE, XT_REG_OTHER, XT_REGF_NOREAD,
     XT_PS_REG_NUM, XT_EPC_REG_NUM_BASE, XT_PC_REG_NUM_VIRTUAL,
@@ -189,8 +192,20 @@ DEBUGCAUSE_DB = 1 << 2          # DBREAK (watchpoint)
 DEBUGCAUSE_BI = 1 << 3          # BREAK instruction
 DEBUGCAUSE_BN = 1 << 4          # BREAK.N instruction
 DEBUGCAUSE_DI = 1 << 5          # Debug Interrupt
+DEBUGCAUSE_DBNUM_SHIFT = 8      # which DBREAK register matched (xtensa_debug_module.h:332)
+DEBUGCAUSE_DBNUM_MASK = 0x0F    # (xtensa_debug_module.h:333)
 # ICOUNT step support (xtensa.c:1788) + STEPREQUEST (xtensa_debug_module.h)
 XT_ICOUNT_STEP_VAL = (-2) & 0xFFFFFFFF   # ICOUNT = -2 loads for a single step
+
+# --- HW breakpoint/watchpoint slot counts — xtensa-core-esp32s3.cfg:43-44
+# (`xtensa xtopt ibreaknum 2` / `dbreaknum 2`, same pinned SHA). This is a Tcl
+# per-core xtopt directive upstream (xtensa.c:3816-3823 clamps it 0..2); the S3
+# (LX7) config fixes it at 2/2, matching the register table's IBREAKA0/1 and
+# DBREAKA0/1+DBREAKC0/1 pairs and xtensa_do_step's existing range(2) DBREAKC
+# save/restore loop. espjtag targets only the S3, so this is a constant rather
+# than a per-chip xtopt table (#58).
+XT_IBREAKS_NUM = 2
+XT_DBREAKS_NUM = 2
 
 
 # The verbatim 97-row xtensa_regs[] table now lives in xtensa_regs.py (imported
@@ -255,6 +270,14 @@ class XtensaCore:
         self.coproc = True
         self.aregs_num = AREGS_NUM
         self.regs_fetched = False           # xtensa->regs_fetched (xtensa.c:1285,1537)
+        # struct xtensa.hw_brps[]/hw_wps[] (xtensa.h) — one slot per IBREAK/DBREAK
+        # register pair, None when free. Written back to IBREAKA/IBREAKENABLE on
+        # every resume (xtensa_prepare_resume, xtensa.c:1694-1706); DBREAKA/DBREAKC
+        # are written directly at add_watchpoint() time (xtensa.c:2761-2763) since
+        # (unlike IBREAK) there is no "FreeRTOS SMP can clobber it" rewrite-on-
+        # resume case for data watchpoints upstream. #58.
+        self.hw_brps = [None] * XT_IBREAKS_NUM
+        self.hw_wps = [None] * XT_DBREAKS_NUM
 
     def desc(self, i):
         """The xtensa_reg_desc for cache index i (xtensa.c:726-727: base table for
@@ -764,7 +787,18 @@ class XtensaXDM:
                 self.xtensa_do_step(current, address, handle_breakpoints)
             if cause & (DEBUGCAUSE_BI | DEBUGCAUSE_BN):     # break instr (xtensa.c:1682)
                 self.xtensa_do_step(current, address, handle_breakpoints)
-        # Write back hw breakpoints (xtensa.c:1692-1700) — none set: bpena stays 0.
+        # Write back hw breakpoints (xtensa.c:1694-1706). Upstream note: "Current
+        # FreeRTOS SMP code can set a hw breakpoint on an exception; we need to
+        # clear that and return to the breakpoints gdb has set on resume" — so
+        # IBREAKA/IBREAKENABLE are rewritten from self.core.hw_brps on EVERY
+        # resume, not just when a breakpoint is first added (#58). NX's extra
+        # IBREAKC0+slot write (xtensa.c:1700-1701) is omitted: core_type is
+        # always XT_LX on the S3, never exercised, same scope as the NX branches
+        # already skipped elsewhere in this file.
+        for slot, bp in enumerate(self.core.hw_brps):
+            if bp is not None:
+                self.xtensa_reg_set(XT_REG_IDX_IBREAKA0 + slot, bp["address"])
+                bpena |= (1 << slot)
         self.xtensa_reg_set(XT_REG_IDX_IBREAKENABLE, bpena)  # LX (xtensa.c:1701-1702)
         self.xtensa_write_dirty_registers()                  # xtensa.c:1704-1705
 
@@ -785,6 +819,162 @@ class XtensaXDM:
         self.xtensa_do_resume()
         # target->debug_reason / state transitions (xtensa.c:1747-1753) are host-side
         # bookkeeping we don't model.
+
+    # ======================================================================
+    # HW breakpoint/watchpoint API — PORTED FROM openocd-esp32 @ a585825d4d0
+    # bbd5b8aff83e01816d2f2c04ffd84 src/target/xtensa/xtensa.c:2632-2811
+    # (xtensa_breakpoint_add/remove, xtensa_watchpoint_add/remove/hit), per
+    # docs/FAITHFUL-REIMPLEMENTATION.md (#58). SW breakpoints (BKPT_SOFT —
+    # xtensa_sw_breakpoint_add/remove, xtensa.c:2583-2630, memory-patching a
+    # BREAK instruction in via xtensa_update_instruction) are OUT OF SCOPE:
+    # issue #58 asks for the IBREAKA/IBREAKC + DBREAKA/DBREAKC match-address
+    # registers specifically, matching the RISC-V side's HW-trigger-only scope
+    # (espjtag/debug.py has no SW breakpoint path either). A hw_brps/hw_wps
+    # slot list lives on XtensaCore (not a `struct xtensa` field directly —
+    # espjtag's equivalent of that struct) since both IBREAK write-back
+    # (xtensa_prepare_resume, above) and algo_context_backup already live
+    # there as the "espjtag struct xtensa" analogue.
+    #
+    # Naming follows espjtag/debug.py's RISC-V add_watchpoint/add_breakpoint/
+    # remove_watchpoint shape (#54) where sensible, but the handle IS the slot
+    # index (0 or 1) rather than an opaque monotonic id: Xtensa has exactly 2
+    # IBREAK + 2 DBREAK hardware slots and no trigger-type negotiation/chaining
+    # (RISC-V's NAPOT/GE+LT fallback chain has no Xtensa equivalent — DBREAKC's
+    # mask field IS the range primitive directly), so there is no multi-trigger
+    # watchpoint needing a id-to-multiple-slots mapping the way a RISC-V ranged
+    # watchpoint can occupy two chained triggers.
+
+    def add_breakpoint(self, address):
+        """xtensa_breakpoint_add (xtensa.c:2632), BKPT_HARD path only (xtensa.c:
+        2658-2673; the BKPT_SOFT branch, xtensa.c:2637-2656, is out of scope —
+        see the class docstring above). Finds a free IBREAK slot (or one
+        already holding THIS address, mirroring the C's
+        `!xtensa->hw_brps[slot] || xtensa->hw_brps[slot] == breakpoint`
+        same-breakpoint-object re-add tolerance — modelled here as "same
+        address" since espjtag has no breakpoint object, only the address).
+        Does NOT write IBREAKA/IBREAKENABLE immediately — upstream defers
+        that to the next xtensa_prepare_resume (xtensa.c:2668 comment: "We
+        will actually write the breakpoints when we resume the target").
+        Returns the slot index (0 or 1) as the handle, or raises RuntimeError
+        if both IBREAK slots are occupied by a different address."""
+        slot = None
+        for i, bp in enumerate(self.core.hw_brps):
+            if bp is None or bp["address"] == address:
+                slot = i
+                break
+        if slot is None:
+            raise RuntimeError(
+                f"add_breakpoint: no free IBREAK slot for addr=0x{address:08x} "
+                f"(all {XT_IBREAKS_NUM} in use)")
+        self.core.hw_brps[slot] = {"address": address & 0xFFFFFFFF}
+        return slot
+
+    def remove_breakpoint(self, handle):
+        """xtensa_breakpoint_remove (xtensa.c:2676), BKPT_HARD path (xtensa.c:
+        2699-2711). Clears the slot; IBREAKENABLE's bit for it is dropped on
+        the next prepare_resume (it only sets bits for slots still occupied).
+        `handle` is the slot index from add_breakpoint(). No-op (xtensa.c's
+        ERROR_TARGET_RESOURCE_NOT_AVAILABLE) if already clear."""
+        if not (0 <= handle < XT_IBREAKS_NUM) or self.core.hw_brps[handle] is None:
+            return False
+        self.core.hw_brps[handle] = None
+        return True
+
+    @staticmethod
+    def _dbreakc_value(length, is_read, is_write):
+        """The DBREAKC bit-packing from xtensa_watchpoint_add (xtensa.c:2739-
+        2759), transcribed verbatim (not re-derived): mask field = ALIGN_DOWN
+        (0x3F, length) -- '0x3F with an incremental bit removed from the LSB
+        for each extra length power of 2' (the C's own comment) -- then
+        BIT(30) for a read trigger, BIT(31) for a write trigger, both for
+        WPT_ACCESS. ALIGN_DOWN(x, a) = x & ~(a-1) (src/helper/align.h, same
+        pinned SHA) -- length is already verified a power of 2 by the caller."""
+        dbreakcval = 0x3F & ~(length - 1)           # ALIGN_DOWN(0x3F, length)
+        if is_read:
+            dbreakcval |= (1 << 30)
+        if is_write:
+            dbreakcval |= (1 << 31)
+        return dbreakcval & 0xFFFFFFFF
+
+    def add_watchpoint(self, address, length=4, is_read=False, is_write=True):
+        """xtensa_watchpoint_add (xtensa.c:2714-2767). The hart must be halted
+        (checked — xtensa.c:2720-2723: `target->state != TARGET_HALTED`).
+        `length` must be a power of 2 in [1,64] with `address` aligned to it
+        (xtensa.c:2741-2751); value masks (WATCHPOINT_IGNORE_DATA_VALUE_MASK
+        is the only value espjtag models, same as upstream's default --
+        xtensa.c:2725-2728's reject-on-anything-else is a no-op here since
+        espjtag has no mask parameter to pass anything else). Writes
+        DBREAKA[slot] and DBREAKC[slot] into the register cache IMMEDIATELY
+        (flushed to silicon on the next xtensa_write_dirty_registers -- unlike
+        IBREAK, DBREAK has no resume-time rewrite in the C). Returns the slot
+        index (0 or 1) as the handle.
+
+        DEVIATION (documented): espjtag has no `target->state` field to check
+        directly; `core.regs_fetched` (set only by xtensa_fetch_all_regs,
+        itself only reachable after a real halt) is used as the halted proxy
+        -- same reasoning as debug.py's RISC-V _enumerate_triggers checking
+        DMSTATUS.allhalted directly since that port also has no target-state
+        object."""
+        if not self.core.regs_fetched:
+            raise RuntimeError("add_watchpoint: core not halted/regs not fetched "
+                               "(call halt() + xtensa_fetch_all_regs() first)")
+        if not is_read and not is_write:
+            raise ValueError("add_watchpoint: at least one of is_read/is_write required")
+        if length < 1 or length > 64 or (length & (length - 1)) != 0 or (address % length) != 0:
+            raise ValueError(
+                f"add_watchpoint: length={length} on addr=0x{address:08x} not "
+                "supported by hardware (must be a power of 2 in [1,64], "
+                "address aligned to length)")
+        slot = None
+        for i, wp in enumerate(self.core.hw_wps):
+            if wp is None or wp["address"] == address:
+                slot = i
+                break
+        if slot is None:
+            raise RuntimeError(
+                f"add_watchpoint: no free DBREAK slot for addr=0x{address:08x} "
+                f"(all {XT_DBREAKS_NUM} in use)")
+        dbreakcval = self._dbreakc_value(length, is_read, is_write)
+        self.xtensa_reg_set(XT_REG_IDX_DBREAKA0 + slot, address & 0xFFFFFFFF)
+        self.xtensa_reg_set(XT_REG_IDX_DBREAKC0 + slot, dbreakcval)
+        self.core.hw_wps[slot] = {"address": address & 0xFFFFFFFF, "length": length,
+                                  "is_read": is_read, "is_write": is_write}
+        return slot
+
+    def remove_watchpoint(self, handle):
+        """xtensa_watchpoint_remove (xtensa.c:2769-2786): DBREAKC[slot] = 0
+        (clears the enable bits -- BIT(30)/BIT(31)) via xtensa_reg_set, clear
+        the slot. `handle` is the slot index from add_watchpoint(). No-op if
+        already clear.
+
+        VERBATIM re: flush timing -- xtensa_reg_set only marks the cache dirty
+        (xtensa.c:1140-1149, the same lazy-write model already ported for
+        every other reg_set call in this file); it does NOT write DBREAKC to
+        silicon immediately. Upstream's xtensa_watchpoint_remove doesn't flush
+        either -- the disarm only reaches hardware on the next
+        xtensa_write_dirty_registers (normally the next resume). Matched here
+        rather than adding an extra flush call upstream doesn't have."""
+        if not (0 <= handle < XT_DBREAKS_NUM) or self.core.hw_wps[handle] is None:
+            return False
+        self.xtensa_reg_set(XT_REG_IDX_DBREAKC0 + handle, 0)
+        self.core.hw_wps[handle] = None
+        return True
+
+    def xtensa_watchpoint_hit(self):
+        """xtensa_watchpoint_hit (xtensa.c:2788-2811). After a halt with
+        DEBUGCAUSE_DB set, DEBUGCAUSE[11:8] (DEBUGCAUSE_DBNUM_SHIFT/MASK,
+        xtensa_debug_module.h:332-333) names which DBREAK slot matched.
+        Returns the slot's watchpoint dict (address/length/is_read/is_write)
+        or None if the cause wasn't a watchpoint or the slot is untracked
+        (mirrors the C's two separate ERROR_FAIL returns -- not distinguished
+        here since espjtag has no exception-vs-"no hit" caller split)."""
+        cause = self.xtensa_cause_get()
+        if not (cause & DEBUGCAUSE_DB):
+            return None
+        dbnum = (cause >> DEBUGCAUSE_DBNUM_SHIFT) & DEBUGCAUSE_DBNUM_MASK
+        if dbnum >= XT_DBREAKS_NUM:
+            return None
+        return self.core.hw_wps[dbnum]
 
     # ======================================================================
     # xtensa_start_algorithm / xtensa_wait_algorithm — PORTED FROM xtensa.c:2810-3017.

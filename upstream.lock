@@ -104,6 +104,98 @@
           "pinned_date_override": "2026-10-21",
           "note": "DM-version-0.13-specific single-step mechanism (#57 step-over-trigger): set_dcsr_config (dcsr.step bit only -- the ebreak*/cetrig fields it also writes are handled separately by espjtag's own reset-run dcsr setup) + riscv013_step_or_resume_current_hart(step=True)'s resumereq/dmstatus handshake (wait for BOTH allresumeack and allhalted, unlike a plain resume which only waits for allrunning). Ported as espjtag/debug.py EspUsbJtag.step(). ALGORITHMIC/STRUCTURAL code, tracked by file presence + SHA only, same as riscv.c above -- no single extractable #define captures step()'s fidelity; the register/field constants it uses (CSR_DCSR_STEP, DM_DMCONTROL_RESUMEREQ, DM_DMSTATUS_ALLRESUMEACK/ALLHALTED) are debug_defines.h symbols, tracked below. Not previously in this lock file -- fetched fresh at the already-pinned a585825d SHA for #57 (raw.githubusercontent.com, sha256 cf1985b2494c3785f021d61a46b3d120445e54260883d4113aee171c87a9d691 of the file as vendored under sources/openocd-riscv-013.c.a585825d).",
           "symbols": []
+        },
+        "xtensa.c": {
+          "path": "src/target/xtensa/xtensa.c",
+          "ported_into": ["espjtag/xtensa.py"],
+          "pinned_sha_override": "a585825d4d0bbd5b8aff83e01816d2f2c04ffd84",
+          "pinned_date_override": "2026-10-21",
+          "note": "Xtensa HW breakpoint/watchpoint API (#58): xtensa_breakpoint_add/remove (xtensa.c:2632-2712, BKPT_HARD path only -- IBREAKA/IBREAKENABLE write-back deferred to the next xtensa_prepare_resume, per the upstream comment at xtensa.c:2668) and xtensa_watchpoint_add/remove/hit (xtensa.c:2714-2811 -- DBREAKA/DBREAKC written immediately into the register cache, the ALIGN_DOWN(0x3F, length) mask-field packing plus BIT(30)/BIT(31) read/write enable bits, and DEBUGCAUSE_DBNUM_SHIFT/MASK slot identification). Also FIXES a pre-existing port gap in the already-present xtensa_prepare_resume (xtensa.c:1694-1706): the IBREAK write-back loop was previously hardcoded to bpena=0 (comment: 'none set') since nothing could occupy hw_brps before this issue -- now reads real espjtag/xtensa.py XtensaCore.hw_brps[]/hw_wps[] (espjtag's struct-xtensa analogue). SW breakpoints (BKPT_SOFT, xtensa.c:2583-2630, xtensa_sw_breakpoint_add/remove + xtensa_update_instruction memory-patching) are OUT OF SCOPE -- issue #58 asks specifically for the HW IBREAKA/IBREAKC + DBREAKA/DBREAKC match registers, matching the RISC-V trigger port's HW-only scope (espjtag/debug.py has no SW breakpoint path either). ALGORITHMIC/STRUCTURAL code, tracked by file presence + SHA only, same as riscv.c/riscv-013.c above. Fetched fresh at the already-pinned a585825d SHA for consistency (raw.githubusercontent.com, sha256 c9ef609e17a6382d324fad10659aadb9fd842d82e2345fdc9de0394741a039bc of the file as vendored under sources/openocd-xtensa.c.a585825d).",
+          "symbols": []
+        },
+        "xtensa_debug_module.h": {
+          "path": "src/target/xtensa/xtensa_debug_module.h",
+          "ported_into": ["espjtag/xtensa.py"],
+          "pinned_sha_override": "a585825d4d0bbd5b8aff83e01816d2f2c04ffd84",
+          "pinned_date_override": "2026-10-21",
+          "note": "DEBUGCAUSE_DBNUM_SHIFT/MASK (xtensa_debug_module.h:332-333, bits [11:8] of DEBUGCAUSE naming which DBREAK slot matched), added for xtensa_watchpoint_hit (#58). The other DEBUGCAUSE bits (IC/IB/DB/BI/BN/DI) were already tracked file-presence-only via xtensa.py's pre-existing #48/#57 port -- this file is now vendored for that reason too (sources/openocd-xtensa_debug_module.h.a585825d, sha256 087449d77d2cfe7c27f07ea368bbbd92e2c0e13baa3abbf2204592b22a04eb3a).",
+          "symbols": [
+            {
+              "name": "DEBUGCAUSE_DBNUM_SHIFT",
+              "kind": "define_int",
+              "regex": "#define\\s+DEBUGCAUSE_DBNUM_SHIFT\\s+(\\d+)",
+              "expected": 8,
+              "depends": "xtensa.py DEBUGCAUSE_DBNUM_SHIFT = 8"
+            },
+            {
+              "name": "DEBUGCAUSE_DBNUM_MASK",
+              "kind": "define_int",
+              "regex": "#define\\s+DEBUGCAUSE_DBNUM_MASK\\s+(0x[0-9A-Fa-f]+|\\d+)",
+              "expected": 15,
+              "depends": "xtensa.py DEBUGCAUSE_DBNUM_MASK = 0x0F"
+            }
+          ]
+        },
+        "xtensa.h": {
+          "path": "src/target/xtensa/xtensa.h",
+          "ported_into": ["espjtag/xtensa.py"],
+          "pinned_sha_override": "a585825d4d0bbd5b8aff83e01816d2f2c04ffd84",
+          "pinned_date_override": "2026-10-21",
+          "note": "struct xtensa.hw_brps[]/hw_wps[] field shape (array-of-slot-pointer, None/NULL = free) -- the model espjtag/xtensa.py XtensaCore.hw_brps/hw_wps copies (#58). Not previously vendored; fetched fresh at the pinned SHA (sources/openocd-xtensa.h.a585825d, sha256 fd03a90b48b6f194767040abd8c63e25a34362e7dac07d0205505175228b3228).",
+          "symbols": []
+        },
+        "breakpoints.h": {
+          "path": "src/target/breakpoints.h",
+          "ported_into": ["espjtag/xtensa.py"],
+          "pinned_sha_override": "a585825d4d0bbd5b8aff83e01816d2f2c04ffd84",
+          "pinned_date_override": "2026-10-21",
+          "note": "enum watchpoint_rw {WPT_READ=0, WPT_WRITE=1, WPT_ACCESS=2} (breakpoints.h:22-23) and WATCHPOINT_IGNORE_DATA_VALUE_MASK (breakpoints.h:39) -- xtensa_watchpoint_add's is_read/is_write parameter pair in espjtag/xtensa.py add_watchpoint() models this enum's 3 cases (read-only/write-only/both) without re-exposing it as a literal enum. Not previously vendored (sources/openocd-breakpoints.h.a585825d, sha256 2cfbe468b14e65c4bab8ac546b678588f4a12a1cd209658576484cb7572ff00a).",
+          "symbols": [
+            {
+              "name": "WPT_READ",
+              "kind": "define_int",
+              "regex": "enum watchpoint_rw \\{\\s*WPT_READ = (\\d+)",
+              "expected": 0,
+              "depends": "xtensa.py add_watchpoint(is_read=True) -> DBREAKC BIT(30)"
+            },
+            {
+              "name": "WPT_WRITE",
+              "kind": "define_int",
+              "regex": "WPT_READ = \\d+, WPT_WRITE = (\\d+)",
+              "expected": 1,
+              "depends": "xtensa.py add_watchpoint(is_write=True) -> DBREAKC BIT(31)"
+            },
+            {
+              "name": "WPT_ACCESS",
+              "kind": "define_int",
+              "regex": "WPT_WRITE = \\d+, WPT_ACCESS = (\\d+)",
+              "expected": 2,
+              "depends": "xtensa.py add_watchpoint(is_read=True, is_write=True) -> DBREAKC BIT(30)|BIT(31)"
+            }
+          ]
+        },
+        "xtensa-core-esp32s3.cfg": {
+          "path": "tcl/target/xtensa-core-esp32s3.cfg",
+          "ported_into": ["espjtag/xtensa.py"],
+          "pinned_sha_override": "a585825d4d0bbd5b8aff83e01816d2f2c04ffd84",
+          "pinned_date_override": "2026-10-21",
+          "note": "`xtensa xtopt ibreaknum 2` / `dbreaknum 2` (xtensa-core-esp32s3.cfg:43-44) -- the S3 (LX7)'s HW breakpoint/watchpoint slot counts, confirmed from the Tcl config rather than assumed from the register table's 2 IBREAKA/2 DBREAKA+DBREAKC entries alone (#58). espjtag/xtensa.py XT_IBREAKS_NUM/XT_DBREAKS_NUM = 2/2 is a constant (not a per-chip xtopt table) since espjtag's Xtensa path only ever targets the S3. Not previously vendored (sources/openocd-xtensa-core-esp32s3.cfg.a585825d, sha256 c78016ffa8ae07245644280355c9c99f7234a0230db3a3605872705af80ff6c2).",
+          "symbols": [
+            {
+              "name": "ibreaknum",
+              "kind": "define_int",
+              "regex": "xtensa xtopt\\s+ibreaknum\\s+(\\d+)",
+              "expected": 2,
+              "depends": "xtensa.py XT_IBREAKS_NUM = 2"
+            },
+            {
+              "name": "dbreaknum",
+              "kind": "define_int",
+              "regex": "xtensa xtopt\\s+dbreaknum\\s+(\\d+)",
+              "expected": 2,
+              "depends": "xtensa.py XT_DBREAKS_NUM = 2"
+            }
+          ]
         }
       }
     },
