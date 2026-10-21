@@ -58,6 +58,7 @@ MOCK_STEPS = [
                               "--tcl", os.path.join(ROOT, "scripts", "test_s3_mock.tcl"))),
     ("riscv-dmi (model)", _s("test_riscv_mock.py")),
     ("riscv-triggers (hw-free)", _s("test_riscv_triggers.py")),
+    ("xtensa-triggers (hw-free)", _s("test_xtensa_triggers.py")),
     ("bootloader-offset (hw-free)", _s("test_bootloader_offset.py")),
 ]
 REAL_STEPS = [

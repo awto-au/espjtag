@@ -109,6 +109,15 @@ class MockXtensaXDM:
     xtensa_prepare_resume = _RealXDM.xtensa_prepare_resume
     xtensa_do_resume = _RealXDM.xtensa_do_resume
     xtensa_resume = _RealXDM.xtensa_resume
+    xtensa_cause_get = _RealXDM.xtensa_cause_get
+    xtensa_cause_clear = _RealXDM.xtensa_cause_clear
+    # --- HW breakpoint/watchpoint API (#58) ---------------------------------
+    add_breakpoint = _RealXDM.add_breakpoint
+    remove_breakpoint = _RealXDM.remove_breakpoint
+    _dbreakc_value = staticmethod(_RealXDM._dbreakc_value)
+    add_watchpoint = _RealXDM.add_watchpoint
+    remove_watchpoint = _RealXDM.remove_watchpoint
+    xtensa_watchpoint_hit = _RealXDM.xtensa_watchpoint_hit
     del _RealXDM
 
     # --- test controls -----------------------------------------------------
@@ -127,10 +136,20 @@ class MockXtensaXDM:
     def resume(self):
         self.ops.append(("resume",))
 
+    def set_halted_with_regs_fetched(self, debugcause=0):
+        """Test control for the #58 HW breakpoint/watchpoint API: real
+        add_watchpoint() gates on core.regs_fetched (set only by
+        xtensa_fetch_all_regs on real hardware, which this mock does not
+        model register-for-register). Sets the precondition directly and
+        seeds DEBUGCAUSE so xtensa_cause_get()/xtensa_watchpoint_hit() see it."""
+        self.core.regs_fetched = True
+        self.xtensa_reg_set(_XT_REG_IDX_DEBUGCAUSE, debugcause)
+        self.core.reg_list[_XT_REG_IDX_DEBUGCAUSE].dirty = False
+
 
 # constants the mock matches on (all live in espjtag.xtensa)
 from .xtensa import (                              # noqa: E402
     DIR0EXEC as _DIR0EXEC, DSR as _DSR, OCDDSR_STOPPED as _OCDDSR_STOPPED,
     INS_RFDO as _INS_RFDO, INS_WSR_EPC6_A3 as _EPC6_WSR,
-    XT_REG_IDX_A0 as _XT_REG_IDX_A0,
+    XT_REG_IDX_A0 as _XT_REG_IDX_A0, XT_REG_IDX_DEBUGCAUSE as _XT_REG_IDX_DEBUGCAUSE,
 )
