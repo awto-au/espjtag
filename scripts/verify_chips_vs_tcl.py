@@ -24,7 +24,7 @@ from espjtag import chips                   # noqa: E402
 OOCD_TARGETS = glob.glob(
     "/home/dan/.espressif/tools/openocd-esp32/*/openocd-esp32/share/openocd/"
     "scripts/target")
-CHIP_CFGS = {"C6": "esp32c6.cfg", "C5": "esp32c5.cfg"}
+CHIP_CFGS = {"C6": "esp32c6.cfg", "C5": "esp32c5.cfg", "P4": "esp32p4.cfg"}
 
 
 def extract_proc(cfg_text, name):

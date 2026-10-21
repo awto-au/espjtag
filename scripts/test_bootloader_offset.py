@@ -113,11 +113,15 @@ def test_c5_reads_offset_0x2000_not_0x0():
 
 def test_chips_bootloader_offset_table():
     """Every CHIPS entry's bootloader_offset matches the ESP-IDF Kconfig
-    default/override table (espjtag#55) — VERIFIED C5=0x2000, everything else
-    (no override tabled) defaults to 0x0 via bootloader_offset_for()."""
+    default/override table (espjtag#55) — VERIFIED C5=0x2000 on the bench;
+    P4=0x2000 is UNVERIFIED (no P4 bench access) but read directly
+    from esp-idf components/esp_rom/esp32p4/esp_rom_caps.h
+    ESP_ROM_BOOTLOADER_OFFSET_FLASH, same P4/C5/H4 family as the C5 one is.
+    Everything else (no override tabled) defaults to 0x0 via
+    bootloader_offset_for()."""
     for idc, e in chips.CHIPS.items():
         name = e.get("name", f"0x{idc:x}")
-        want = 0x2000 if name == "C5" else 0x0
+        want = 0x2000 if name in ("C5", "P4") else 0x0
         check(f"{name} bootloader_offset_for()", chips.bootloader_offset_for(idc), want)
 
 

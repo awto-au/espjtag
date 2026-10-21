@@ -63,7 +63,7 @@ class EspUsbJtagTransport:
     # need listing (single-TAP is the class default above).
     _CHAIN_BY_IDCODE = chips.chain_by_idcode()
 
-    def __init__(self, usb_path=None, serial=None, tap=None):
+    def __init__(self, usb_path=None, serial=None, tap=None, hart=0):
         # `tap` — optional TAP override for multi-TAP chains, in TDO-first order
         # (same convention as idcode_index). None = the chips.py table default.
         # ESP32-S3 (VERIFIED live, espjtag#50): tap0 = cpu0/procpu — the core a
@@ -73,6 +73,17 @@ class EspUsbJtagTransport:
         # diagnosis of a running app needs tap=0; the table default stays tap1
         # until the flasher is re-verified on tap0 (tracked in #50).
         self._tap_override = tap
+        # `hart` — which RISC-V Debug Module hart this instance drives, for a
+        # chip where >1 hart shares one DM/TAP (chips.py hart_count>1 — the
+        # ESP32-P4's cpu0/cpu1). Default 0 is the single-hart case every
+        # other chip uses — debug.py ORs this into every dmcontrol write
+        # via the hartsel field (constants.DM_DMCONTROL_HARTSELLO), a no-op
+        # (field value 0, hardware's reset state) when hart=0. Distinct axis
+        # from `tap`: the S3's two cores are two separate TAPs (select via
+        # tap=), the P4's two HP cores share one TAP/DM (select via hart=) —
+        # the same split OpenOCD makes as `-tap` vs `-coreid`
+        # (tcl/target/esp_common.cfg create_openocd_targets).
+        self.hart = hart
         # Pin the right unit when several 303a:1001 are on the bus. Two keys:
         #   serial   — the device's USB serial (the MAC); STABLE across re-enumer-
         #              ation. PREFER THIS: a board that drops and comes back under
