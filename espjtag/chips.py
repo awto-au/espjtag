@@ -24,6 +24,11 @@ Each entry carries:
   flash_xip   the cache-mapped flash window base (SBA can't read it — use progbuf)
   sram        a scratch SRAM window {data, stack, trap} the flash loader stages
               args/buffer/return-trap into while the hart is HALTED (#3)
+  hart_count  number of harts sharing this entry's DM/TAP (omitted = 1, the
+              single-hart default). >1 means callers select a hart via
+              EspUsbJtag(hart=N) — debug.py's DMCONTROL writes OR in that hart's
+              hartsel field (constants.DM_DMCONTROL_HARTSELLO), a no-op for
+              every hart_count-omitted (default hart=0) chip. First user: P4.
 
 Values are MEASURED / sourced (cite in comments), not guessed. Unknown fields are
 omitted rather than filled with a plausible-but-wrong number — a wrong ROM address
@@ -238,6 +243,145 @@ CHIPS = {
         abits=7,                  # ASSUMED (single-TAP), UNVERIFIED
         chain=_SINGLE_TAP,
         flash_xip=0x42000000,
+        verified=False,
+    ),
+
+    # ---- ESP32-P4 (two-TAP RISC-V, dual HP core + hartsel) -------------------
+    # UNVERIFIED: no P4 was on the bench when this was tabled. Every
+    # value below is transcribed from openocd-esp32 @ f10eceff22fb8dcd3db69bf3eb
+    # c5c70602454af6 (the SHA this repo pins — upstream.lock) tcl/target/esp32p4.cfg
+    # + esp_common.cfg, cross-checked against esp-idf @ 383dda6c (2026-10-19)
+    # headers where noted. MUST be confirmed on real silicon before trusting it
+    # for flash/reset ops — a wrong ROM/reset address wedges the chip.
+    #
+    # CHAIN: esp32p4.cfg sets _LP_TAPNUM=1, _HP_TAPNUM=1, no _LP_TAPID override ->
+    # esp_common.cfg create_esp_jtag()'s "legacy: all taps share one ID" branch,
+    # same as the C5. create_openocd_targets(): with _LP_TAPNUM>0 && _HP_TAPNUM>0,
+    # next_tap_num=1 -> BOTH cpu0 (coreid 0) and cpu1 (coreid 1, _ONLYCPU default
+    # 0x03) bind to tap1 (_HP_TAPNUM is 1, not >1, so no second HP tap is
+    # allocated) — one TAP shared by both HP cores, tap0 is the (by-default-
+    # undriven) LP core's tap sitting toward TDO. Same two-TAP shape as C5/C61:
+    # reuse _C5_TWO_TAP (taps_after=1, idcode_index=1).
+    #
+    # MULTI-HART: cpu0/cpu1 are "-coreid 0"/"-coreid 1" on the SAME target/DM —
+    # OpenOCD's riscv013_halt_go/resume/etc. select between them via plain
+    # hartsel (dm013_select_hart -> set_dmcontrol_hartsel), confirmed from
+    # riscv-013.c select_prepped_harts(): hasel/hawindow is reserved for
+    # `target smp`'s simultaneous-halt convenience (totaling >1 prepped hart in
+    # one DMI write), which this port doesn't need — espjtag's one-instance-
+    # one-hart model (mirroring how the S3 already does one-instance-one-TAP
+    # via `tap=`) only ever selects ONE hart at a time. EspUsbJtag(hart=1)
+    # targets cpu1; hart=0 (default) is cpu0 and is IDENTICAL in wire behaviour
+    # to every existing single-hart chip (hartsel field = 0, its reset value).
+    #
+    # LP core (3rd hart, esp32p4.lp.cpu, "-coreid 0" with _ONLYCPU|=0x10) is OUT
+    # OF SCOPE: no esp32p4-lpcore.cfg ships at the pinned f10eceff SHA (only in
+    # the separately-versioned openocd-esp32 release tree, which this repo does
+    # not pin) — enabling it needs a DIFFERENT _ONLYCPU and the lpcore_reset
+    # sequence this port has not read/verified. Track as follow-up if LP-core
+    # debug is ever wanted.
+    0x00012C25: dict(
+        name="P4",
+        core="riscv",
+        chain=_C5_TWO_TAP,
+        # abits: UNMEASURED (no bench access) — OpenOCD reads it live from DTMCS
+        # on every chip (riscv-013.c dtmcontrol_scan), never hardcodes it per
+        # part, so there is no cfg/header value to transcribe here. Deliberately
+        # omitted rather than guessed; chips.abits_for() returns None and
+        # whatever does live DTMCS detection (the existing C6/C5 pattern) must
+        # measure it on first contact with real hardware.
+        hart_count=2,          # cpu0 (hart 0) + cpu1 (hart 1); LP core excluded, see above
+        # Flash-mapped cache window — esp-idf components/soc/esp32p4/include/
+        # soc/soc.h SOC_IROM_LOW/SOC_DROM_LOW = 0x40000000..0x44000000. NOT the
+        # 0x42000000 the single-region C6/C5/S3 use — P4's MMU/cache map is a
+        # different, larger architecture (confirmed in soc.h, not assumed).
+        flash_xip=0x40000000,
+        # esp-idf components/esp_rom/esp32p4/esp_rom_caps.h:32
+        # ESP_ROM_BOOTLOADER_OFFSET_FLASH (0x2000) -- read directly (the Kconfig
+        # default espjtag#55 cites now just references this symbol, refactored
+        # since; P4 is in the same "needs room for a bigger partition table"
+        # family as C5/H4).
+        bootloader_offset=0x2000,
+        # SoC reset regs used by reset_run_from_rom — VERBATIM DMI sequence from
+        # esp32p4.cfg esp32p4_soc_reset (NOT re-derived from headers; LP_SYS_SYS_
+        # CTRL_REG address cross-checked against esp-idf components/soc/esp32p4/
+        # register/hw_ver1/soc/lp_system_reg.h: LP_SYSTEM_REG_SYS_CTRL_REG =
+        # DR_REG_LP_SYS_BASE + 0x8 = 0x50110008, matches). Structurally DIFFERENT
+        # from the C6/C5 LP_AON single-register pulse: P4 stalls both HP cores via
+        # System-Bus-Access writes to the PMU (0x50115200 cpu_sw_stall), THEN pulses
+        # LP_SYS_SYS_SW_RST (bit 1) at 0x50110008 (read-modify-write, preserving
+        # the other FIB-select bits the cfg comment calls out), THEN force-enables
+        # peripheral clocks at 0x500e60b4 so the post-reset WDT-disable SBA writes
+        # land on a clocked bus. No chips.py `reset` dict shape fits this (the
+        # existing reset_for()/reset_run_from_rom in debug.py assumes the simple
+        # two-register LP_AON pulse) -- reset_run_from_rom is NOT wired for P4 in
+        # this change (would need its own method mirroring esp32p4_soc_reset
+        # verbatim, ported + mock-tested separately). Tabled here as a literal
+        # transcription for that follow-up, not yet read by debug.py:
+        reset_p4=dict(
+            sb_cs_claim=0x40000,                   # per-target: dmcontrol hartsel|haltreq, then sbcs
+            pmu_cpu_sw_stall_addr=0x50115200, pmu_cpu_sw_stall_unstall=0xFFFF0000,
+            sb_cs_read_orig=0x140000,               # sbcs for the read-modify-write of LP_SYS_SYS_CTRL_REG
+            lp_sys_sys_ctrl_reg=0x50110008, lp_sys_sys_sw_rst_bit=0x2,
+            clk_force_on_addr=0x500E60B4, clk_force_on_val=0x3FFFF,
+        ),
+        # Watchdogs to disable while HALTED. VERBATIM from openocd-esp32
+        # tcl/target/esp32p4.cfg esp32p4_wdt_disable (runs on hart0 only, per
+        # esp32p4_cpu0_wdt_disable's explicit "Select hart0" comment — the WDT
+        # registers are shared SoC state, not per-core, so one disable covers
+        # both harts). Cross-checked offsets vs esp-idf components/soc/esp32p4/
+        # register/hw_ver1/soc/{timer_group_reg.h,lp_wdt_reg.h}: TIMG_WDTCONFIG0
+        # +0x48/TIMG_WDTWPROTECT +0x64 (TG0 base 0x500C2000/TG1 0x500C3000 ->
+        # matches 0x500c2048/0x500c2064/0x500c3048/0x500c3064); LP_WDT_CONFIG0
+        # +0x0/WPROTECT +0x18 (LP_WDT base 0x50116000 -> matches 0x50116000/
+        # 0x50116018); LP_WDT_SWD_CONFIG +0x1c/SWD_WPROTECT +0x20 (matches
+        # 0x5011601C/0x50116020); LP_WDT_INT_CLR +0x30 (matches 0x50116030).
+        wdt=dict(
+            key=0x50D83AA1,
+            disable=[
+                (0x500C2064, 0x500C2048, 0x00000000),   # TG0 WDT
+                (0x500C3064, 0x500C3048, 0x00000000),   # TG1 WDT
+                (0x50116018, 0x50116000, 0x00000000),   # LP_WDT_RTC
+                (0x50116020, 0x5011601C, 0x40000000),   # LP_WDT_SWD (super-WDT)
+            ],
+            int_clear=[
+                (0x500C207C, 0x00000004),                # TG0 wdt int state
+                (0x500C307C, 0x00000004),                # TG1 wdt int state
+                (0x50116030, 0xC0000000),                # LP_WDT_RTC + SWD int state
+            ],
+        ),
+        # ROM SPI-flash helpers (esp-idf components/esp_rom/esp32p4/ld/
+        # esp32p4.rom.ld) for the flash loader (#3). NOT yet exercised against
+        # real P4 flash (no bench access) — tabled from the .rom.ld symbol list
+        # the same way the C6/C5 tables were, but unlike those, UNVERIFIED live.
+        rom=dict(
+            spiflash_wait_idle=0x4FC00118,
+            spiflash_erase_sector=0x4FC0014C,
+            spiflash_erase_block=0x4FC00150,     # 64 KiB block erase
+            spiflash_write=0x4FC00154,
+            spiflash_read=0x4FC00158,
+            spiflash_unlock=0x4FC0015C,
+            spiflash_config_param=0x4FC00168,
+            spiflash_read_user_cmd=0x4FC0016C,   # (status*, cmd) — RDID via 0x9F
+            spiflash_config_clk=0x4FC00180,
+            spiflash_config_readmode=0x4FC00184,
+            spi_flash_attach=0x4FC001E8,
+            crc32_le=0x4FC005EC,                 # on-chip CRC-32 for incremental (#34)
+            tinfl_decompress_mem_to_mem=0x4FC00104,  # ROM miniz inflate (#36)
+        ),
+        # scratch at the top of P4 IRAM — esp-idf soc.h SOC_IRAM_LOW/HIGH =
+        # 0x4ff00000..0x4ffc0000 (768 KiB; same role as C6/C5's SOC_IRAM, just a
+        # different address range — P4's own, not reused from another chip).
+        # Matches esp32p4.cfg's own workarea base (_WA_ADDR 0x4FF00000, pinned-
+        # SHA f10eceff version; the newer installed-binary cfg uses 0x8FF00000,
+        # an address-space-alias difference not yet understood — flagged, not
+        # guessed past).
+        sram=dict(
+            data=0x4FFBC000,     # staging buffer base (grows up; < trap)
+            trap=0x4FFBBF00,     # ebreak return-trap word (below data, ra points here)
+            stack=0x4FFBF000,    # SP top (grows down toward data; 12 KiB headroom)
+            top=0x4FFC0000,      # SOC_IRAM_HIGH (bound; never write at/above)
+        ),
         verified=False,
     ),
 

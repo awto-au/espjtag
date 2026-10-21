@@ -22,13 +22,18 @@ class MockEspUsbJtag:
     read_idcode / read_dtmcs. usb.util.dispose_resources(self.dev) is a no-op
     here (self.dev is a stub)."""
 
-    def __init__(self, idcode=0x0000DC25):     # default: an ESP32-C6 IDCODE
+    def __init__(self, idcode=0x0000DC25, hart=0):   # default: an ESP32-C6 IDCODE
         self.dm = {}                  # Debug-Module register model {address: u32}
         self.dm_seq = {}              # {address: [v0, v1, ...]} scripted read queue
         self.dmi_writes = []          # [(address, value)] every dmi_write, in order
         self.dmi_reads = []           # [address]
         self.ops = []                 # full op log
         self.idcode = idcode
+        # which DM hart this mock drives (chips.py hart_count>1 — the P4's two
+        # HP cores); default 0 matches every single-hart chip. Threaded through
+        # _dmcontrol (borrowed from EspUsbJtag below) exactly like the real
+        # transport.
+        self.hart = hart
         self.dev = _StubDev()         # so usb.util.dispose_resources(j.dev) works
 
     # --- the transport surface debug.py calls ------------------------------
@@ -75,6 +80,7 @@ class MockEspUsbJtag:
     # test call j.halt() / j.read_register() and assert the DMI sequence with no
     # hardware. (Methods that touch USB endpoints directly are NOT borrowed.)
     from .debug import EspUsbJtag as _RealDM
+    _dmcontrol = _RealDM._dmcontrol        # hartsel-aware DMCONTROL write (ESP32-P4 chip support)
     halt = _RealDM.halt
     resume = _RealDM.resume
     examine = _RealDM.examine

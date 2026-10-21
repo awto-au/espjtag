@@ -62,6 +62,26 @@ DM_ACKHAVERESET = 1 << 28          # 0x10000000
 DM_HARTRESET = 1 << 29             # 0x20000000
 DM_RESUMEREQ = 1 << 30            # 0x40000000
 DM_HALTREQ = 1 << 31             # 0x80000000
+
+# dmcontrol hartsel (debug_defines.h DM_DMCONTROL_HARTSELLO/HI_OFFSET/LENGTH,
+# already-pinned a585825d). Selects which hart in the DM every other dmcontrol
+# bit (haltreq/resumereq/ndmreset/...) applies to -- OpenOCD's
+# set_dmcontrol_hartsel (riscv-013.c) ORs this into EVERY dmcontrol write, not
+# just a dedicated "select" op. espjtag was single-hart-only (hartsel always 0,
+# the field's reset value) until the ESP32-P4 (dual HP core, one DM): see
+# EspUsbJtag._dmcontrol() below, the P4's own one chokepoint for this.
+# hasel/hawindow (simultaneous multi-hart select, same header) are NOT used
+# here -- confirmed from riscv-013.c select_prepped_harts(): hasel only backs
+# OpenOCD's `target smp` convenience (halt every hart in one DMI round-trip);
+# normal per-hart ops (halt/resume/step/reg access) use plain hartsel via
+# dm013_select_hart -> set_dmcontrol_hartsel, which is the only mechanism
+# espjtag's one-hart-per-instance model needs.
+DM_DMCONTROL_HARTSELLO_OFFSET = 0x10
+DM_DMCONTROL_HARTSELLO_LENGTH = 0xA
+DM_DMCONTROL_HARTSELLO = 0x3FF0000
+DM_DMCONTROL_HARTSELHI_OFFSET = 6
+DM_DMCONTROL_HARTSELHI_LENGTH = 0xA
+DM_DMCONTROL_HARTSELHI = 0xFFC0
 # dmstatus bits
 DM_ANYRUNNING = 1 << 10
 DM_ALLHALTED = 1 << 9

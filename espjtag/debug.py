@@ -24,6 +24,7 @@ from .constants import (
     SBCS, SBADDRESS0, SBDATA0, DMI_READ, DMI_WRITE, DMI_NOP,
     SB_SBERROR, SB_SBBUSYERROR,
     DM_DMACTIVE, DM_NDMRESET, DM_ACKHAVERESET, DM_RESUMEREQ, DM_HALTREQ,
+    DM_DMCONTROL_HARTSELLO, DM_DMCONTROL_HARTSELLO_LENGTH,
     DM_ALLHALTED, DM_ALLRUNNING, DM_ALLHAVERESET,
     DM_ANYRUNNING, DM_ALLRESUMEACK, DM_ALLUNAVAIL,
     ABS_BUSY, ABS_CMDERR,
@@ -116,6 +117,22 @@ class EspUsbJtag(EspUsbJtagTransport):
         d, _ = self.dmi_read(addr)
         return d
 
+    def _dmcontrol(self, bits):
+        """Write `bits` to DMCONTROL with this instance's hart OR'd into the
+        hartsel field — OpenOCD's set_dmcontrol_hartsel (riscv-013.c), applied
+        at every single dmcontrol write, not just a dedicated "select hart" op
+        (dm013_select_hart does the same: build the whole value, hartsel
+        included, in one write). self.hart defaults to 0 (transport.py
+        __init__), under which this is `bits | 0` — IDENTICAL to the bare
+        self.dmi_write(DMCONTROL, bits) every single-hart chip (C3/C5/C6/H2)
+        used before ESP32-P4 chip support was added, so no existing behaviour
+        changes. hartsello alone (10 bits, values 0-1023) covers the P4's 2
+        harts; hartselhi (also in debug_defines.h) is for >1024 harts and
+        unused by any currently-tabled chip."""
+        hartsel = (self.hart & ((1 << DM_DMCONTROL_HARTSELLO_LENGTH) - 1)) << (
+            (DM_DMCONTROL_HARTSELLO & -DM_DMCONTROL_HARTSELLO).bit_length() - 1)
+        self.dmi_write(DMCONTROL, bits | hartsel)
+
     def halt(self, timeout=200, disable_wdt=True):
         """Request halt and wait for allhalted. Returns True if halted.
 
@@ -123,10 +140,10 @@ class EspUsbJtag(EspUsbJtagTransport):
         WDT can't reset the chip out from under the debugger while it's held halted
         — the C6 halt-flakiness fix (probe-rs + OpenOCD both do this). Pass
         disable_wdt=False to leave them running."""
-        self.dmi_write(DMCONTROL, DM_HALTREQ | DM_DMACTIVE)
+        self._dmcontrol(DM_HALTREQ | DM_DMACTIVE)
         for _ in range(timeout):
             if self.dm_read(DMSTATUS) & DM_ALLHALTED:
-                self.dmi_write(DMCONTROL, DM_DMACTIVE)     # drop haltreq
+                self._dmcontrol(DM_DMACTIVE)     # drop haltreq
                 if disable_wdt:
                     self._wdt_disable()
                 # #57 step-over-trigger: record whether this halt was a
@@ -156,19 +173,19 @@ class EspUsbJtag(EspUsbJtagTransport):
         # watched instruction, and re-arm it before the real resume below —
         # otherwise this resume just re-fires at the identical PC forever.
         self._step_over_trigger_if_needed()
-        self.dmi_write(DMCONTROL, DM_RESUMEREQ | DM_DMACTIVE)
+        self._dmcontrol(DM_RESUMEREQ | DM_DMACTIVE)
         for _ in range(timeout):
             if self.dm_read(DMSTATUS) & DM_ALLRUNNING:
-                self.dmi_write(DMCONTROL, DM_DMACTIVE)
+                self._dmcontrol(DM_DMACTIVE)
                 return True
         return False
 
     def examine(self):
         """Bring the DM up: dmactive, clear any stale havereset, read dmstatus."""
-        self.dmi_write(DMCONTROL, DM_DMACTIVE)
+        self._dmcontrol(DM_DMACTIVE)
         st = self.dm_read(DMSTATUS)
         if st & DM_ALLHAVERESET:
-            self.dmi_write(DMCONTROL, DM_ACKHAVERESET | DM_DMACTIVE)
+            self._dmcontrol(DM_ACKHAVERESET | DM_DMACTIVE)
         return st
 
     # === Abstract command: read/write GPRs and CSRs =======================
@@ -432,11 +449,11 @@ class EspUsbJtag(EspUsbJtagTransport):
         # resume handshake (mirrors _resume_go): set resumereq, wait for the hart
         # to ack it is running, THEN clear resumereq — otherwise the request can
         # race and never take. Then poll for the ebreak re-halt.
-        self.dmi_write(DMCONTROL, DM_RESUMEREQ | DM_DMACTIVE)
+        self._dmcontrol(DM_RESUMEREQ | DM_DMACTIVE)
         for _ in range(256):
             if self.dm_read(DMSTATUS) & (DM_ALLRESUMEACK | DM_ALLRUNNING):
                 break
-        self.dmi_write(DMCONTROL, DM_DMACTIVE)                 # resumereq <- 0
+        self._dmcontrol(DM_DMACTIVE)                 # resumereq <- 0
         if not wait:
             return saved          # pipeline ctx: finish with _call_finish(ctx)
         return self._call_finish(saved, timeout, restore)
@@ -459,11 +476,11 @@ class EspUsbJtag(EspUsbJtagTransport):
             # abstract command in the session. Re-halt, restore the app's
             # registers, and fail CLEANLY so the caller can attempt recovery
             # (flash_init re-attaches the controller).
-            self.dmi_write(DMCONTROL, DM_HALTREQ | DM_DMACTIVE)
+            self._dmcontrol(DM_HALTREQ | DM_DMACTIVE)
             for _ in range(256):
                 if self.dm_read(DMSTATUS) & DM_ALLHALTED:
                     break
-            self.dmi_write(DMCONTROL, DM_DMACTIVE)
+            self._dmcontrol(DM_DMACTIVE)
             if restore and (self.dm_read(DMSTATUS) & DM_ALLHALTED):
                 self.write_registers(list(saved.items()))
             return None, False
@@ -1340,7 +1357,7 @@ class EspUsbJtag(EspUsbJtagTransport):
         WHEN the clearing write happens, not whether it happens."""
         dcsr = self.read_register(CSR_DCSR)
         self.write_register(CSR_DCSR, dcsr | CSR_DCSR_STEP)
-        self.dmi_write(DMCONTROL, DM_RESUMEREQ | DM_DMACTIVE)
+        self._dmcontrol(DM_RESUMEREQ | DM_DMACTIVE)
         ok = False
         for _ in range(200):
             st = self.dm_read(DMSTATUS)
@@ -1349,7 +1366,7 @@ class EspUsbJtag(EspUsbJtagTransport):
             if st & DM_ALLHALTED:
                 ok = True
                 break
-        self.dmi_write(DMCONTROL, DM_DMACTIVE)             # resumereq <- 0
+        self._dmcontrol(DM_DMACTIVE)             # resumereq <- 0
         # restore dcsr.step regardless of outcome — never leave the hart
         # permanently in single-step mode.
         self.write_register(CSR_DCSR, dcsr & ~CSR_DCSR_STEP)
@@ -2044,14 +2061,14 @@ class EspUsbJtag(EspUsbJtagTransport):
         if log:
             log("  -- pre-reset diag --")
             self.diag(log)
-        self.dmi_write(DMCONTROL, DM_DMACTIVE)                          # claim DM
-        self.dmi_write(DMCONTROL, DM_RESUMEREQ | DM_DMACTIVE)           # 0x40000001
-        self.dmi_write(DMCONTROL, DM_HALTREQ | DM_NDMRESET | DM_DMACTIVE)  # 0x80000003
+        self._dmcontrol(DM_DMACTIVE)                          # claim DM
+        self._dmcontrol(DM_RESUMEREQ | DM_DMACTIVE)           # 0x40000001
+        self._dmcontrol(DM_HALTREQ | DM_NDMRESET | DM_DMACTIVE)  # 0x80000003
         time.sleep(0.05)
-        self.dmi_write(DMCONTROL, DM_HALTREQ | DM_DMACTIVE)             # deassert ndmreset, keep halted
-        self.dmi_write(DMCONTROL, DM_ACKHAVERESET | DM_DMACTIVE)        # ack the reset
-        self.dmi_write(DMCONTROL, DM_RESUMEREQ | DM_DMACTIVE)           # RUN
-        self.dmi_write(DMCONTROL, 0)                                    # release DM
+        self._dmcontrol(DM_HALTREQ | DM_DMACTIVE)             # deassert ndmreset, keep halted
+        self._dmcontrol(DM_ACKHAVERESET | DM_DMACTIVE)        # ack the reset
+        self._dmcontrol(DM_RESUMEREQ | DM_DMACTIVE)           # RUN
+        self._dmcontrol(0)                                    # release DM
         usb.util.dispose_resources(self.dev)
 
     # === Faithful OpenOCD `reset run` building blocks (riscv-013.c) =========
@@ -2062,13 +2079,13 @@ class EspUsbJtag(EspUsbJtagTransport):
     def _halt_go(self, timeout=256):
         """riscv013_halt_go: set haltreq, poll dmstatus until no hart is running,
         then drop haltreq. Returns True if halted."""
-        self.dmi_write(DMCONTROL, DM_HALTREQ | DM_DMACTIVE)
+        self._dmcontrol(DM_HALTREQ | DM_DMACTIVE)
         ok = False
         for _ in range(timeout):
             if not (self.dm_read(DMSTATUS) & DM_ANYRUNNING):
                 ok = True
                 break
-        self.dmi_write(DMCONTROL, DM_DMACTIVE)            # haltreq <- 0
+        self._dmcontrol(DM_DMACTIVE)            # haltreq <- 0
         return ok
 
     def _set_dcsr_ebreak(self):
@@ -2085,16 +2102,16 @@ class EspUsbJtag(EspUsbJtagTransport):
         """riscv013_step_or_resume_current_hart(step=false): set resumereq, poll
         dmstatus until allresumeack (fail on allunavail), then clear resumereq.
         Returns True on a clean resume. The hart must be halted first."""
-        self.dmi_write(DMCONTROL, DM_RESUMEREQ | DM_DMACTIVE)
+        self._dmcontrol(DM_RESUMEREQ | DM_DMACTIVE)
         for _ in range(timeout):
             st = self.dm_read(DMSTATUS)
             if st & DM_ALLUNAVAIL:
-                self.dmi_write(DMCONTROL, DM_DMACTIVE)
+                self._dmcontrol(DM_DMACTIVE)
                 return False
             if st & DM_ALLRESUMEACK:
-                self.dmi_write(DMCONTROL, DM_DMACTIVE)    # resumereq <- 0
+                self._dmcontrol(DM_DMACTIVE)    # resumereq <- 0
                 return True
-        self.dmi_write(DMCONTROL, DM_DMACTIVE)
+        self._dmcontrol(DM_DMACTIVE)
         return False
 
     def _c6_soc_reset(self):
@@ -2114,28 +2131,28 @@ class EspUsbJtag(EspUsbJtagTransport):
             raise RuntimeError(
                 "_c6_soc_reset: no tabled SoC reset registers for this IDCODE "
                 f"0x{self.read_idcode():08x} — refusing to guess reset addresses")
-        self.dmi_write(DMCONTROL, DM_HALTREQ | DM_DMACTIVE)              # 0x80000001
+        self._dmcontrol(DM_HALTREQ | DM_DMACTIVE)              # 0x80000001
         # LP_AON_SYS_CFG = HPSYS_SW_RESET  (write 0x80000000 to 0x600b1034 via SBA)
         self.write_mem32(rst["hpsys_cfg"], rst["hpsys_sw_reset"])
-        self.dmi_write(DMCONTROL, 0)                                     # clear sbbusy
+        self._dmcontrol(0)                                     # clear sbbusy
         # LP_AON_CPUCORE0_CFG = CPU_CORE0_SW_RESET (0x10000000 to 0x600b1038)
         self.write_mem32(rst["cpucore0_cfg"], rst["cpucore0_sw_reset"])
-        self.dmi_write(DMCONTROL, 0)                                     # clear sbbusy
-        self.dmi_write(DMCONTROL, DM_RESUMEREQ | DM_DMACTIVE)            # 0x40000001
+        self._dmcontrol(0)                                     # clear sbbusy
+        self._dmcontrol(DM_RESUMEREQ | DM_DMACTIVE)            # 0x40000001
         time.sleep(0.01)                                                 # OpenOCD `sleep 10` (ms): let the SW reset propagate before re-asserting
-        self.dmi_write(DMCONTROL, DM_RESUMEREQ | DM_DMACTIVE)            # 0x40000001 (clear allhalted)
-        self.dmi_write(DMCONTROL, DM_HALTREQ | DM_NDMRESET | DM_DMACTIVE)  # 0x80000003 hold in reset
+        self._dmcontrol(DM_RESUMEREQ | DM_DMACTIVE)            # 0x40000001 (clear allhalted)
+        self._dmcontrol(DM_HALTREQ | DM_NDMRESET | DM_DMACTIVE)  # 0x80000003 hold in reset
 
     def _deassert_reset(self, timeout=256):
         """riscv_deassert_reset: clear ndmreset (write dmactive, haltreq=0 for a
         `run`), poll dmstatus until the hart has left reset (NOT allunavail-without-
         havereset), then ackhavereset."""
-        self.dmi_write(DMCONTROL, DM_DMACTIVE)            # ndmreset <- 0, haltreq <- 0
+        self._dmcontrol(DM_DMACTIVE)            # ndmreset <- 0, haltreq <- 0
         for _ in range(timeout):
             st = self.dm_read(DMSTATUS)
             if not (st & DM_ALLUNAVAIL) or (st & DM_ALLHAVERESET):
                 break
-        self.dmi_write(DMCONTROL, DM_ACKHAVERESET | DM_DMACTIVE)
+        self._dmcontrol(DM_ACKHAVERESET | DM_DMACTIVE)
 
     def reset_run_from_rom(self, log=None):
         """Boot a freshly-flashed ESP32-C6 OUT of post-flash USB-Serial/JTAG ROM

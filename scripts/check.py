@@ -60,6 +60,7 @@ MOCK_STEPS = [
     ("riscv-triggers (hw-free)", _s("test_riscv_triggers.py")),
     ("xtensa-triggers (hw-free)", _s("test_xtensa_triggers.py")),
     ("bootloader-offset (hw-free)", _s("test_bootloader_offset.py")),
+    ("multi-hart (hw-free)", _s("test_multihart.py")),
 ]
 REAL_STEPS = [
     ("selftest+dmireset C6", _s("validate_dmireset.py", "--usb-path", C6_USB)),
