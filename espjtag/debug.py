@@ -1380,26 +1380,30 @@ class EspUsbJtag(EspUsbJtagTransport):
         return ready, rw, xw
 
     def _rom_flash_ready(self, nwords=4):
-        """SAFETY GATE for any ROM erase/program. Read flash offset 0 via the ROM
-        esp_rom_spiflash_read and require the first byte to be the ESP image magic
-        0xE9 — the 2nd-stage bootloader header sits at flash 0 on every ESP target.
+        """SAFETY GATE for any ROM erase/program. Read the 2nd-stage bootloader
+        header via the ROM esp_rom_spiflash_read and require the first byte to be
+        the ESP image magic 0xE9. The header's flash offset is PER CHIP, not
+        always 0 (espjtag#55) — chips.bootloader_offset_for() gives the right
+        value: 0x0 for C6/C3/H2/S3/etc, 0x2000 for C5/P4/H4 (ESP-IDF
+        components/bootloader/Kconfig.projbuild BOOTLOADER_OFFSET_IN_FLASH).
         A correct 0xE9 proves the ROM read path is configured (attach dummy cycles +
         config_param geometry); garbage (the running app left the controller in
         fast-XIP mode) means erase/program would target a misconfigured chip, so we
         refuse (brick risk). (Earlier this compared against flash_read_xip, but the
-        XIP window maps the app's region, not raw flash 0 — never a valid reference.)
+        XIP window maps the app's region, not raw flash — never a valid reference.)
         Read-only; icache toggled around the ROM read. Returns (ready, rom_words, magic)."""
         c = self._chip()
         rom, sram = c.get("rom"), c.get("sram")
         if not rom or not sram or "spiflash_read" not in rom:
             return False, None, None
+        offset = c.get("bootloader_offset", 0x0)
         dest = sram["data"]
         saved = self.read_mem(dest, nwords)
         has_cache = "cache_disable_icache" in rom
         try:
             if has_cache:
                 self.call_rom("cache_disable_icache")
-            ret, halted = self.call_rom("spiflash_read", args=(0x0, dest, nwords * 4))
+            ret, halted = self.call_rom("spiflash_read", args=(offset, dest, nwords * 4))
             rom_words = self.read_mem(dest, nwords)
             if has_cache:
                 self.call_rom("cache_enable_icache")

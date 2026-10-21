@@ -1213,19 +1213,27 @@ class XtensaXDM:
         return self.read_mem(buf, nwords)
 
     def _rom_flash_ready(self, nwords=4):
-        """SAFETY GATE for any ROM erase/program (mirrors debug.py): read flash offset
-        0 via esp_rom_spiflash_read and require the first byte to be the ESP image magic
-        0xE9. A correct 0xE9 proves the ROM read path is configured; anything else means
+        """SAFETY GATE for any ROM erase/program (mirrors debug.py): read the
+        2nd-stage bootloader header via esp_rom_spiflash_read and require the
+        first byte to be the ESP image magic 0xE9. The header's flash offset is
+        PER CHIP, not always 0 (espjtag#55) — chips.bootloader_offset_for() gives
+        the right value (0x0 for the S3; ESP-IDF components/bootloader/
+        Kconfig.projbuild BOOTLOADER_OFFSET_IN_FLASH only overrides P4/C5/H4).
+        A correct 0xE9 proves the ROM read path is configured; anything else means
         erase/program would target a misconfigured chip, so callers must refuse.
         Read-only. Returns (ready, rom_words, magic)."""
         c = self._chip()
         rom, sram = c.get("rom"), c.get("sram")
         if not rom or not sram or "spiflash_read" not in rom:
             return False, None, None
+        # NOTE: reads the CACHED chip dict's offset (c, from __init__), not a fresh
+        # chips.bootloader_offset_for(read_idcode()) — see __init__'s comment on why
+        # re-deriving from a later read_idcode() is unsafe here (stale NAR traffic).
+        offset = c.get("bootloader_offset", 0x0)
         dest = sram["data"]
         saved = self.read_mem(dest, nwords)
         try:
-            ret, halted = self.call_rom("spiflash_read", args=(0x0, dest, nwords * 4))
+            ret, halted = self.call_rom("spiflash_read", args=(offset, dest, nwords * 4))
             rom_words = self.read_mem(dest, nwords)
             magic = (rom_words[0] & 0xFF) if rom_words else None
             ready = bool(halted) and ret == 0 and magic == 0xE9
