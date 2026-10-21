@@ -108,3 +108,130 @@ EBREAK = 0x00100073
 DCSR_EBREAKU = 1 << 12                   # 0x1000
 DCSR_EBREAKM = 1 << 15                   # 0x8000
 DCSR_EBREAK_BITS = DCSR_EBREAKM | DCSR_EBREAKU   # -> turns 0xc3 into 0x90c3
+
+# Standard RISC-V privileged-spec CSR (not Debug Module); not in debug_defines.h
+# (that file only has the Debug Module's own registers). Same provenance class
+# as CSR_MSTATUS above: a fixed, well-known CSR number, not sourced from
+# debug_defines.h. Used to read misa.{S,U,H} the way OpenOCD's
+# riscv_supports_extension() does (riscv.c, see fill_match_triggers_tdata1_fields_t2/t6).
+CSR_MISA = 0x301
+MISA_EXT_S = 1 << (ord('S') - ord('A'))
+MISA_EXT_U = 1 << (ord('U') - ord('A'))
+MISA_EXT_H = 1 << (ord('H') - ord('A'))
+
+# === RISC-V trigger module (watchpoints/breakpoints) ===================
+# openocd-esp32 src/target/riscv/debug_defines.h @ a585825d4d0bbd5b8aff83e01816d2f2c04ffd84
+# (2026-10-21; the already-pinned f10eceff.. SHA's debug_defines.h is confirmed
+# byte-identical for this file, so these values hold at either SHA — see
+# scripts/check_upstream.py run notes in the trigger-support commit).
+# Pinned upstream: ../upstream.lock. Provenance: ../ACKNOWLEDGEMENTS.md.
+#
+# espjtag targets RV32 parts only (C3/C5/C6 — RV32IMAC/RV32IMAFC); the upstream
+# macros are parameterised on XLEN, so every mask below is that macro evaluated
+# at XLEN=32 — transcribed, not re-derived.
+XLEN = 32
+
+# Trigger CSR numbers (debug_defines.h:540,544,637,645)
+CSR_TSELECT = 0x7A0
+CSR_TDATA1 = 0x7A1
+CSR_TDATA2 = 0x7A2
+CSR_TINFO = 0x7A4
+
+# tdata1.type field — common to every trigger type (debug_defines.h:545-547,
+# CSR_TDATA1_TYPE_OFFSET(XLEN)=(XLEN-4), CSR_TDATA1_TYPE(XLEN)=0xf<<(XLEN-4))
+CSR_TDATA1_TYPE_OFFSET = XLEN - 4                      # 28
+CSR_TDATA1_TYPE_MASK = 0xF << CSR_TDATA1_TYPE_OFFSET   # 0xf0000000
+# tdata1.type values (debug_defines.h:551-601)
+CSR_TDATA1_TYPE_NONE = 0
+CSR_TDATA1_TYPE_LEGACY = 1
+CSR_TDATA1_TYPE_MCONTROL = 2
+CSR_TDATA1_TYPE_ICOUNT = 3
+CSR_TDATA1_TYPE_ITRIGGER = 4
+CSR_TDATA1_TYPE_ETRIGGER = 5
+CSR_TDATA1_TYPE_MCONTROL6 = 6
+CSR_TDATA1_TYPE_TMEXTTRIGGER = 7
+CSR_TDATA1_TYPE_DISABLED = 15
+
+# tinfo (debug_defines.h:649,651,679)
+CSR_TINFO_VERSION_OFFSET = 0x18
+CSR_TINFO_VERSION_MASK = 0xFF000000
+CSR_TINFO_INFO_MASK = 0xFFFF            # trigger-type-support bitmask, bit N = type N
+
+# mcontrol (type 2, legacy match trigger) fields at XLEN=32 (debug_defines.h:742-1100)
+CSR_MCONTROL_TYPE_OFFSET = XLEN - 4                          # 28 (:743)
+CSR_MCONTROL_TYPE_MASK = 0xF << CSR_MCONTROL_TYPE_OFFSET
+CSR_MCONTROL_DMODE_OFFSET = XLEN - 5                         # 27 (:746)
+CSR_MCONTROL_DMODE_MASK = 1 << CSR_MCONTROL_DMODE_OFFSET
+CSR_MCONTROL_MASKMAX_OFFSET = XLEN - 11                      # 21 (:757)
+CSR_MCONTROL_MASKMAX_MASK = 0x3F << CSR_MCONTROL_MASKMAX_OFFSET
+CSR_MCONTROL_SIZELO_OFFSET = 0x10                            # (:854-856)
+CSR_MCONTROL_SIZELO_MASK = 0x30000
+CSR_MCONTROL_SIZELO_ANY = 0                                  # (:862)
+CSR_MCONTROL_SIZEHI_OFFSET = 0x15                            # (:766-768, XLEN>=64 only)
+CSR_MCONTROL_SIZEHI_MASK = 0x600000
+CSR_MCONTROL_ACTION_OFFSET = 0xC                             # (:925-927)
+CSR_MCONTROL_ACTION_MASK = 0xF000
+CSR_MCONTROL_ACTION_DEBUG_MODE = 1                           # (:935)
+CSR_MCONTROL_CHAIN_OFFSET = 0xB                              # (:956-958)
+CSR_MCONTROL_CHAIN_MASK = 0x800
+CSR_MCONTROL_CHAIN_DISABLED = 0                              # (:962)
+CSR_MCONTROL_CHAIN_ENABLED = 1                               # (:967)
+CSR_MCONTROL_MATCH_OFFSET = 0x7                              # (:992-994)
+CSR_MCONTROL_MATCH_MASK = 0x780
+CSR_MCONTROL_MATCH_EQUAL = 0                                 # (:998)
+CSR_MCONTROL_MATCH_NAPOT = 1                                 # (:1008)
+CSR_MCONTROL_MATCH_GE = 2                                    # (:1013)
+CSR_MCONTROL_MATCH_LT = 3                                    # (:1018)
+CSR_MCONTROL_M_OFFSET = 6                                    # (:1061-1063)
+CSR_MCONTROL_M_MASK = 0x40
+CSR_MCONTROL_S_OFFSET = 4                                    # (:1069-1071)
+CSR_MCONTROL_S_MASK = 0x10
+CSR_MCONTROL_U_OFFSET = 3                                    # (:1077-1079)
+CSR_MCONTROL_U_MASK = 0x8
+CSR_MCONTROL_EXECUTE_OFFSET = 2                              # (:1084-1086)
+CSR_MCONTROL_EXECUTE_MASK = 0x4
+CSR_MCONTROL_STORE_OFFSET = 1                                # (:1091-1093)
+CSR_MCONTROL_STORE_MASK = 0x2
+CSR_MCONTROL_LOAD_OFFSET = 0                                 # (:1098-1100)
+CSR_MCONTROL_LOAD_MASK = 0x1
+
+# mcontrol6 (type 6, what C3/C5/C6 actually report) fields at XLEN=32
+# (debug_defines.h:1101-1462). NOTE (#trigger-port): MATCH_OFFSET=7 (4 bits,
+# bits 7-10) and M_OFFSET=6 — previously mis-remembered as MATCH=10/M=9, which
+# overlapped; transcribed directly from the header this time, not from memory.
+CSR_MCONTROL6_TYPE_OFFSET = XLEN - 4                         # 28 (:1102)
+CSR_MCONTROL6_TYPE_MASK = 0xF << CSR_MCONTROL6_TYPE_OFFSET
+CSR_MCONTROL6_DMODE_OFFSET = XLEN - 5                        # 27 (:1105)
+CSR_MCONTROL6_DMODE_MASK = 1 << CSR_MCONTROL6_DMODE_OFFSET
+CSR_MCONTROL6_VS_OFFSET = 0x18                               # (:1134)
+CSR_MCONTROL6_VS_MASK = 0x1000000
+CSR_MCONTROL6_VU_OFFSET = 0x17                               # (:1142)
+CSR_MCONTROL6_VU_MASK = 0x800000
+CSR_MCONTROL6_SIZE_OFFSET = 0x10                             # (:1212)
+CSR_MCONTROL6_SIZE_MASK = 0x70000
+CSR_MCONTROL6_SIZE_ANY = 0                                   # (:1220)
+CSR_MCONTROL6_ACTION_OFFSET = 0xC                            # (:1271)
+CSR_MCONTROL6_ACTION_MASK = 0xF000
+CSR_MCONTROL6_ACTION_DEBUG_MODE = 1                          # (:1281)
+CSR_MCONTROL6_CHAIN_OFFSET = 0xB                             # (:1302)
+CSR_MCONTROL6_CHAIN_MASK = 0x800
+CSR_MCONTROL6_CHAIN_DISABLED = 0                             # (:1308)
+CSR_MCONTROL6_CHAIN_ENABLED = 1                              # (:1313)
+CSR_MCONTROL6_MATCH_OFFSET = 7                               # (:1338)
+CSR_MCONTROL6_MATCH_MASK = 0x780
+CSR_MCONTROL6_MATCH_EQUAL = 0                                # (:1344)
+CSR_MCONTROL6_MATCH_NAPOT = 1                                # (:1356)
+CSR_MCONTROL6_MATCH_GE = 2                                   # (:1361)
+CSR_MCONTROL6_MATCH_LT = 3                                   # (:1366)
+CSR_MCONTROL6_M_OFFSET = 6                                   # (:1409-1411)
+CSR_MCONTROL6_M_MASK = 0x40
+CSR_MCONTROL6_S_OFFSET = 4                                   # (:1431-1433)
+CSR_MCONTROL6_S_MASK = 0x10
+CSR_MCONTROL6_U_OFFSET = 3                                   # (:1439-1441)
+CSR_MCONTROL6_U_MASK = 0x8
+CSR_MCONTROL6_EXECUTE_OFFSET = 2                             # (:1446-1448)
+CSR_MCONTROL6_EXECUTE_MASK = 0x4
+CSR_MCONTROL6_STORE_OFFSET = 1                               # (:1453-1455)
+CSR_MCONTROL6_STORE_MASK = 0x2
+CSR_MCONTROL6_LOAD_OFFSET = 0                                # (:1460-1462)
+CSR_MCONTROL6_LOAD_MASK = 0x1

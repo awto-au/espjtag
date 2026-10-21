@@ -15,14 +15,21 @@ below).
 
 ## What we ported, and from where
 
-Pinned upstream baseline (both files vendored in the same repo):
-**`espressif/openocd-esp32` @ `f10eceff22fb8dcd3db69bf3ebc5c70602454af6`** (`master`, 2026-06-10).
+Pinned upstream baseline (all files vendored in the same repo):
+**`espressif/openocd-esp32` @ `f10eceff22fb8dcd3db69bf3ebc5c70602454af6`** (`master`, 2026-06-10)
+for the original USB-JTAG/DM-register port, and **@ `a585825d4d0bbd5b8aff83e01816d2f2c04ffd84`**
+(`master`, 2026-10-21) for the trigger-module port (`#trigger-port`) added on top —
+`debug_defines.h` is confirmed byte-identical between the two SHAs, so the two
+baselines agree on everything both reference. See `upstream.lock` for the exact
+per-file pin.
 
 | espjtag file | Ported facts | Upstream source | Upstream license |
 |---|---|---|---|
 | `espjtag/constants.py`, `espjtag/transport.py` | USB-JTAG vendor protocol: the 4-bit `CMD_CLK` nibble layout (`bit0=TDI, bit1=TMS, bit2=capture`), `CMD_FLUSH=0xA`, `VEND_JTAG_SETDIV=0`, caps-descriptor `wValue=0x2000` | `src/jtag/drivers/esp_usb_jtag.c` | **GPL-2.0-or-later** |
 | `espjtag/transport.py` | The TAP scan model — shift N−1 bits with TMS=0, last bit with TMS=1 → Exit1, all captured (an algorithm, mirrored, not copied) | `src/jtag/drivers/bitq.c` | **GPL-2.0-or-later** |
 | `espjtag/constants.py`, `transport.py`, `debug.py` | RISC-V Debug Module register addresses (DMCONTROL=0x10, DMSTATUS=0x11, ABSTRACTCS=0x16, COMMAND=0x17, DATA0=0x04, SBCS=0x38, …) and field bit-offsets (dmcontrol haltreq=31/resumereq=30/ndmreset=1/…, abstractcs busy=12/cmderr=8, AC access-register aarsize=20/transfer=17/write=16, SBCS access=17/autoinc=16/…, DTM dmi op=0/data=2/address=34) | `src/target/riscv/debug_defines.h` | **BSD-2-Clause OR CC-BY-4.0** (SPDX dual) |
+| `espjtag/constants.py`, `debug.py` | RISC-V **trigger CSR numbers** (TSELECT=0x7a0, TDATA1=0x7a1, TDATA2=0x7a2, TINFO=0x7a4) and **mcontrol/mcontrol6 field offsets/masks** (type, dmode, match, chain, m/s/u/execute/load/store, maskmax, size, action) — scalar facts, same category as the row above, at a newer SHA (`a585825d4d0bbd5b8aff83e01816d2f2c04ffd84`, 2026-10-21; `debug_defines.h` confirmed byte-identical to the pinned SHA for this file before bumping) | `src/target/riscv/debug_defines.h` | **BSD-2-Clause OR CC-BY-4.0** (SPDX dual) |
+| `espjtag/debug.py` (the trigger-module methods, `#trigger-port`) | The RISC-V **trigger/watchpoint setup algorithm** itself: `set_trigger`'s disable/write/verify DMI sequence, the NAPOT/chained-GE+LT/equality-match fallback order, the negative-result cache, and trigger enumeration — ported function-by-function per `docs/FAITHFUL-REIMPLEMENTATION.md` ("copy it 1:1"), not just facts. This is **closer, structural porting** than the bitq.c scan-loop row above — see the dedicated note below. | `src/target/riscv/riscv.c` @ `a585825d4d0bbd5b8aff83e01816d2f2c04ffd84` | **GPL-2.0-or-later** |
 
 `debug_defines.h` carries `SPDX-License-Identifier: BSD-2-Clause OR CC-BY-4.0`
 and is itself auto-generated from the **RISC-V External Debug Support** spec
@@ -79,11 +86,47 @@ not copyrightable**, only their creative *expression / arrangement* is:
   "files … which contain no creative expression … may not be copyrightable").
   <https://reuse.software/faq/>
 
-**What we actually did** reduces the exposure regardless of how that question
-lands: we transcribed ~4 scalar values and re-expressed the *algorithm* of
-`bitq.c` in our own Python — we did **not** copy code, comments, structure, or
-the macro text. Re-expressing a method in clean code is the ordinary,
-well-trodden way to interoperate across a license boundary.
+### 3. The trigger-module port from GPL `riscv.c` — a CLOSER port than #2, flag for review
+
+Unlike the four scalar USB-JTAG facts in #2, the trigger/watchpoint methods in
+`espjtag/debug.py` (`#trigger-port`) are a genuine **function-by-function
+structural port** of `src/target/riscv/riscv.c`'s control flow — `set_trigger`'s
+exact disable/write/verify sequence, the NAPOT/chained-GE+LT/equality fallback
+*order and conditions*, the enumeration loop's three-way error branching, the
+negative-result cache's lookup/insert logic. This was done deliberately, per
+this repo's own `docs/FAITHFUL-REIMPLEMENTATION.md` ("if your port differs from
+the source, that difference is a bug until proven otherwise" — copy first,
+understand later), because getting hardware trigger setup subtly wrong is a
+silent-failure risk, not a style preference.
+
+This is **not** the "uncopyrightable fact" or "merger doctrine" case #1/#2 lean
+on — an algorithm's *sequencing and branching structure*, independently
+re-expressed in a different language (Python control flow, not a textual
+translation; no C source text, comments, or identifiers copied verbatim; data
+structures changed where idiomatic — dicts/sets instead of C's intrusive linked
+lists for the trigger cache, Python exceptions instead of OpenOCD's integer
+error codes) sits closer to "a clean-room reimplementation of a known algorithm"
+than to "a bare numeric fact". That is a *more* defensible position than #2, not
+less — reimplementing documented behavior in your own code, independently
+expressed, is the standard interoperability pattern — but it is a **meaningfully
+different case from #1/#2** and worth the maintainer's own look rather than
+folding silently into the "four integers" framing above.
+
+**What we actually did** for `bitq.c` (TAP scan model) and now `riscv.c`
+(trigger module): re-expressed the *algorithm* in our own Python — not copying
+code, comments, structure names, or the macro text — using the same function
+names and comments only as a navigational aid back to the source (cited in
+every docstring), not reproduced from it. Re-expressing a method in clean code
+is the ordinary, well-trodden way to interoperate across a license boundary;
+`riscv.c` just does more of it than `bitq.c`'s one scan loop. If a stricter
+posture is wanted, options (b)/(c) below apply to this port too, and are worth
+weighing more seriously here than for the four USB-JTAG integers.
+
+**What we actually did overall** reduces the exposure regardless of how that
+question lands: beyond the scalar facts (#1/#2/the trigger CSR constants in the
+table above), the *algorithms* (`bitq.c`'s scan loop, `riscv.c`'s trigger setup)
+were re-expressed in our own Python — we did **not** copy code, comments,
+structure, or the macro/function text verbatim.
 
 ### Recommendation (for the maintainer to accept or override)
 
@@ -92,14 +135,22 @@ well-trodden way to interoperate across a license boundary.
    attribution that BSD-2-Clause requires and that good practice expects for the
    GPL-derived facts even if attribution is not strictly compelled.
 2. **If a stricter posture is wanted**, the cleanest options are, in order:
-   (a) add a short notice that the *four* USB-JTAG protocol constants are facts
-   derived from GPL-2.0 `esp_usb_jtag.c` and used as uncopyrightable interface
-   data (essentially what this section already does, made load-bearing in
-   `NOTICE`); or (b) dual-note just `transport.py`'s protocol constants; or
-   (c) relicense espjtag GPL-2.0-or-later to remove the question entirely (costs
-   the permissive licensing — probably not worth it for four integers).
+   (a) add a short notice that the USB-JTAG protocol constants and the trigger-
+   module algorithm are, respectively, facts and an independently-re-expressed
+   method derived from GPL-2.0 `esp_usb_jtag.c`/`riscv.c`, used under the
+   uncopyrightable-facts / clean-reimplementation readings above (essentially
+   what this section already does, made load-bearing in `NOTICE`); or (b)
+   dual-note just `transport.py`'s protocol constants and `debug.py`'s trigger
+   methods specifically; or (c) relicense espjtag GPL-2.0-or-later to remove the
+   question entirely (costs the permissive licensing — a bigger ask once a whole
+   algorithm, not just four integers, is in scope — weigh #3 above before
+   dismissing this option for that reason alone).
 3. **Do not** copy any *text* (code, macros, comments) from the GPL files into
-   espjtag. Porting must stay at the level of facts + independently-written code.
+   espjtag. Porting must stay at the level of facts + independently-written code
+   — true today for `riscv.c` (function names/structure mirror the source for
+   diffability per `docs/FAITHFUL-REIMPLEMENTATION.md`, but no C text is copied),
+   and worth re-checking at the "before claiming done" diff pass any time this
+   port is touched again.
 
 If in doubt about a specific downstream use (e.g. linking espjtag into a larger
 proprietary product), get an actual legal opinion — the above is orientation, not

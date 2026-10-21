@@ -88,6 +88,14 @@
               "depends": "chips.py reset.cpucore0_cfg=0x600B1038 + cpucore0_sw_reset=0x10000000"
             }
           ]
+        },
+        "riscv.c": {
+          "path": "src/target/riscv/riscv.c",
+          "ported_into": ["espjtag/debug.py"],
+          "pinned_sha_override": "a585825d4d0bbd5b8aff83e01816d2f2c04ffd84",
+          "pinned_date_override": "2026-10-21",
+          "note": "RISC-V trigger module (watchpoint/breakpoint) setup: can_use_napot_match, find_next_free_trigger, count_trailing_ones, set_trigger, maybe_add_trigger_t1, the wp_triggers negative-result cache, try_setup_{single,chained}_match_trigger(s), fill_match_triggers_tdata1_fields_t{2,6}, maybe_add_trigger_t2_t6{,_for_wp,_for_bp}, add_trigger, and the trigger-enumeration functions (check_if_trigger_exists/get_trigger_types/disable_trigger_if_dmode/riscv_enumerate_triggers) (#trigger-port). This is ALGORITHMIC/STRUCTURAL code (control flow, not scalar #defines) -- tracked by file presence + SHA only, same as bitq.c above; no extractable single-value symbol captures 'is this port still faithful'. Re-verify by re-reading riscv.c at a newer pinned_sha_override and diffing function bodies per docs/FAITHFUL-REIMPLEMENTATION.md, not by this script. debug_defines.h's own symbols (above) still catch field/offset drift.",
+          "symbols": []
         }
       }
     },
@@ -97,13 +105,14 @@
       "default_branch": "master",
       "license": "BSD-2-Clause OR CC-BY-4.0",
       "license_note": "debug_defines.h is auto-generated from the RISC-V external debug spec (riscv/riscv-debug-spec) and carries an SPDX dual license; the BSD-2-Clause arm is Apache-2.0 compatible. Vendored in the openocd-esp32 tree, so pinned at the same SHA.",
-      "pinned_sha": "f10eceff22fb8dcd3db69bf3ebc5c70602454af6",
-      "pinned_date": "2026-06-10",
+      "pinned_sha": "a585825d4d0bbd5b8aff83e01816d2f2c04ffd84",
+      "pinned_date": "2026-10-21",
+      "_bump_note": "bumped from f10eceff22fb8dcd3db69bf3ebc5c70602454af6 (2026-06-10) for the trigger-module port (#trigger-port); scripts/check_upstream.py confirmed debug_defines.h is byte-identical between both SHAs before this bump, so no previously-pinned expected value changed.",
       "files": {
         "debug_defines.h": {
           "path": "src/target/riscv/debug_defines.h",
           "ported_into": ["espjtag/constants.py", "espjtag/transport.py", "espjtag/debug.py"],
-          "note": "RISC-V Debug Module register addresses + field offsets. Values are *_OFFSET (bit position) or bare register address; espjtag derives masks as 1<<OFFSET.",
+          "note": "RISC-V Debug Module register addresses + field offsets. Values are *_OFFSET (bit position) or bare register address; espjtag derives masks as 1<<OFFSET. Trigger-module symbols (CSR_TSELECT/TDATA1/TDATA2/TINFO, mcontrol/mcontrol6 field offsets) added for the trigger/watchpoint port (#trigger-port).",
           "symbols": [
             {"name": "DTM_DMI_OP_OFFSET",        "kind": "define_int", "regex": "#define\\s+DTM_DMI_OP_OFFSET\\s+(0x[0-9A-Fa-f]+|\\d+)",        "expected": 0,  "depends": "DMI scan op field at bits[1:0]"},
             {"name": "DTM_DMI_DATA_OFFSET",      "kind": "define_int", "regex": "#define\\s+DTM_DMI_DATA_OFFSET\\s+(0x[0-9A-Fa-f]+|\\d+)",      "expected": 2,  "depends": "DMI scan data field at bits[33:2] -> word=(data<<2)"},
@@ -147,7 +156,29 @@
             {"name": "DM_SBCS_SBREADONADDR_OFFSET",      "kind": "define_int", "regex": "#define\\s+DM_SBCS_SBREADONADDR_OFFSET\\s+(0x[0-9A-Fa-f]+|\\d+)",      "expected": 20, "depends": "debug._sb_setup() readonaddr = 1<<20"},
             {"name": "DM_SBCS_SBACCESS_OFFSET",          "kind": "define_int", "regex": "#define\\s+DM_SBCS_SBACCESS_OFFSET\\s+(0x[0-9A-Fa-f]+|\\d+)",          "expected": 17, "depends": "debug._sb_setup() sbaccess = size<<17"},
             {"name": "DM_SBCS_SBAUTOINCREMENT_OFFSET",   "kind": "define_int", "regex": "#define\\s+DM_SBCS_SBAUTOINCREMENT_OFFSET\\s+(0x[0-9A-Fa-f]+|\\d+)",   "expected": 16, "depends": "debug._sb_setup() autoincrement = 1<<16"},
-            {"name": "DM_SBCS_SBREADONDATA_OFFSET",      "kind": "define_int", "regex": "#define\\s+DM_SBCS_SBREADONDATA_OFFSET\\s+(0x[0-9A-Fa-f]+|\\d+)",      "expected": 15, "depends": "debug._sb_setup() readondata = 1<<15"}
+            {"name": "DM_SBCS_SBREADONDATA_OFFSET",      "kind": "define_int", "regex": "#define\\s+DM_SBCS_SBREADONDATA_OFFSET\\s+(0x[0-9A-Fa-f]+|\\d+)",      "expected": 15, "depends": "debug._sb_setup() readondata = 1<<15"},
+
+            {"name": "CSR_TSELECT",              "kind": "define_int", "regex": "#define\\s+CSR_TSELECT\\s+(0x[0-9A-Fa-f]+|\\d+)",              "expected": 1952, "depends": "constants.CSR_TSELECT = 0x7a0 (#trigger-port set_trigger)"},
+            {"name": "CSR_TDATA1",               "kind": "define_int", "regex": "#define\\s+CSR_TDATA1\\s+(0x[0-9A-Fa-f]+|\\d+)",               "expected": 1953, "depends": "constants.CSR_TDATA1 = 0x7a1 (#trigger-port set_trigger)"},
+            {"name": "CSR_TDATA2",               "kind": "define_int", "regex": "#define\\s+CSR_TDATA2\\s+(0x[0-9A-Fa-f]+|\\d+)",               "expected": 1954, "depends": "constants.CSR_TDATA2 = 0x7a2 (#trigger-port set_trigger)"},
+            {"name": "CSR_TINFO",                "kind": "define_int", "regex": "#define\\s+CSR_TINFO\\s+(0x[0-9A-Fa-f]+|\\d+)",                "expected": 1956, "depends": "constants.CSR_TINFO = 0x7a4 (#trigger-port enumerate_triggers)"},
+            {"name": "CSR_TDATA1_TYPE_LEGACY",   "kind": "define_int", "regex": "#define\\s+CSR_TDATA1_TYPE_LEGACY\\s+(0x[0-9A-Fa-f]+|\\d+)",   "expected": 1,  "depends": "constants.CSR_TDATA1_TYPE_LEGACY = 1 (#trigger-port maybe_add_trigger_t1)"},
+            {"name": "CSR_TDATA1_TYPE_MCONTROL", "kind": "define_int", "regex": "#define\\s+CSR_TDATA1_TYPE_MCONTROL\\s+(0x[0-9A-Fa-f]+|\\d+)", "expected": 2,  "depends": "constants.CSR_TDATA1_TYPE_MCONTROL = 2 (#trigger-port set_trigger/fill_..._t2)"},
+            {"name": "CSR_TDATA1_TYPE_MCONTROL6","kind": "define_int", "regex": "#define\\s+CSR_TDATA1_TYPE_MCONTROL6\\s+(0x[0-9A-Fa-f]+|\\d+)","expected": 6,  "depends": "constants.CSR_TDATA1_TYPE_MCONTROL6 = 6 -- what C3/C5/C6 actually report (#trigger-port)"},
+            {"name": "CSR_MCONTROL6_MATCH_OFFSET","kind": "macro_line", "regex": "#define\\s+CSR_MCONTROL6_MATCH_OFFSET\\s+(.+)",              "expected": "7ULL", "depends": "constants.CSR_MCONTROL6_MATCH_OFFSET = 7 (bits 7-10; previously mis-remembered as 10, #trigger-port)"},
+            {"name": "CSR_MCONTROL6_M_OFFSET",    "kind": "macro_line", "regex": "#define\\s+CSR_MCONTROL6_M_OFFSET\\s+(.+)",                  "expected": "6ULL", "depends": "constants.CSR_MCONTROL6_M_OFFSET = 6 (previously mis-remembered as 9, overlapped MATCH, #trigger-port)"},
+            {"name": "CSR_MCONTROL6_CHAIN_OFFSET","kind": "macro_line", "regex": "#define\\s+CSR_MCONTROL6_CHAIN_OFFSET\\s+(.+)",              "expected": "0xbULL", "depends": "constants.CSR_MCONTROL6_CHAIN_OFFSET = 0xb (#trigger-port fill_..._t6)"},
+            {"name": "CSR_MCONTROL6_ACTION_OFFSET","kind": "macro_line", "regex": "#define\\s+CSR_MCONTROL6_ACTION_OFFSET\\s+(.+)",            "expected": "0xcULL", "depends": "constants.CSR_MCONTROL6_ACTION_OFFSET = 0xc (#trigger-port fill_..._t6)"},
+            {"name": "CSR_MCONTROL6_SIZE_OFFSET", "kind": "macro_line", "regex": "#define\\s+CSR_MCONTROL6_SIZE_OFFSET\\s+(.+)",                "expected": "0x10ULL", "depends": "constants.CSR_MCONTROL6_SIZE_OFFSET = 0x10 (#trigger-port fill_..._t6)"},
+            {"name": "CSR_MCONTROL6_VS_OFFSET",   "kind": "macro_line", "regex": "#define\\s+CSR_MCONTROL6_VS_OFFSET\\s+(.+)",                  "expected": "0x18ULL", "depends": "constants.CSR_MCONTROL6_VS_OFFSET = 0x18 (#trigger-port fill_..._t6)"},
+            {"name": "CSR_MCONTROL6_VU_OFFSET",   "kind": "macro_line", "regex": "#define\\s+CSR_MCONTROL6_VU_OFFSET\\s+(.+)",                  "expected": "0x17ULL", "depends": "constants.CSR_MCONTROL6_VU_OFFSET = 0x17 (#trigger-port fill_..._t6)"},
+            {"name": "CSR_MCONTROL6_S_OFFSET",    "kind": "macro_line", "regex": "#define\\s+CSR_MCONTROL6_S_OFFSET\\s+(.+)",                  "expected": "4ULL", "depends": "constants.CSR_MCONTROL6_S_OFFSET = 4 (#trigger-port fill_..._t6)"},
+            {"name": "CSR_MCONTROL6_U_OFFSET",    "kind": "macro_line", "regex": "#define\\s+CSR_MCONTROL6_U_OFFSET\\s+(.+)",                  "expected": "3ULL", "depends": "constants.CSR_MCONTROL6_U_OFFSET = 3 (#trigger-port fill_..._t6)"},
+            {"name": "CSR_MCONTROL6_EXECUTE_OFFSET","kind": "macro_line", "regex": "#define\\s+CSR_MCONTROL6_EXECUTE_OFFSET\\s+(.+)",          "expected": "2ULL", "depends": "constants.CSR_MCONTROL6_EXECUTE_OFFSET = 2 (#trigger-port fill_..._t6)"},
+            {"name": "CSR_MCONTROL6_STORE_OFFSET","kind": "macro_line", "regex": "#define\\s+CSR_MCONTROL6_STORE_OFFSET\\s+(.+)",                "expected": "1ULL", "depends": "constants.CSR_MCONTROL6_STORE_OFFSET = 1 (#trigger-port fill_..._t6)"},
+            {"name": "CSR_MCONTROL6_LOAD_OFFSET", "kind": "macro_line", "regex": "#define\\s+CSR_MCONTROL6_LOAD_OFFSET\\s+(.+)",                "expected": "0ULL", "depends": "constants.CSR_MCONTROL6_LOAD_OFFSET = 0 (#trigger-port fill_..._t6)"},
+            {"name": "CSR_MCONTROL_MASKMAX_OFFSET(XLEN)", "kind": "macro_line", "regex": "#define\\s+CSR_MCONTROL_MASKMAX_OFFSET\\(XLEN\\)\\s+(.+)", "expected": "((XLEN) + -0xbULL)", "depends": "constants.CSR_MCONTROL_MASKMAX_OFFSET = XLEN-11 (#trigger-port set_trigger NAPOT maskmax check)"},
+            {"name": "CSR_TDATA1_TYPE_OFFSET(XLEN)", "kind": "macro_line", "regex": "#define\\s+CSR_TDATA1_TYPE_OFFSET\\(XLEN\\)\\s+(.+)",        "expected": "((XLEN) + -4ULL)", "depends": "constants.CSR_TDATA1_TYPE_OFFSET = XLEN-4 (#trigger-port set_trigger/enumerate_triggers)"}
           ]
         }
       }

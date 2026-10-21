@@ -12,3 +12,8 @@ tmp/
 docs/chats/
 
 .claude/settings.local.json
+
+# Locally-fetched upstream reference files (pinned SHA + facts transcribed into
+# upstream.lock / ACKNOWLEDGEMENTS.md, not vendored wholesale — re-fetch at the
+# pinned SHA from github.com/espressif/openocd-esp32 when needed again).
+sources/

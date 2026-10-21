@@ -1,11 +1,15 @@
 """espjtag.debug — the full RISC-V debugger built on the transport: halt/resume,
 GPR/CSR read+write (abstract command), memory read/write (System Bus Access),
-diag, and the reset_run() method. EspUsbJtag is the public class most users want.
+diag, the reset_run() method, and the trigger module (watchpoints/breakpoints,
+#trigger-port). EspUsbJtag is the public class most users want.
 
 DM register addresses + field offsets used here are ported from the RISC-V debug
 spec via openocd-esp32 src/target/riscv/debug_defines.h (BSD-2-Clause OR
 CC-BY-4.0); the reset_run() DMI sequence was captured from OpenOCD's `reset run`
--d3 log. Pinned upstream: ../upstream.lock. Provenance: ../ACKNOWLEDGEMENTS.md.
+-d3 log. The trigger module is ported function-by-function from openocd-esp32
+src/target/riscv/riscv.c @ a585825d4d0bbd5b8aff83e01816d2f2c04ffd84 (GPL-2.0-or-
+later) per docs/FAITHFUL-REIMPLEMENTATION.md. Pinned upstream: ../upstream.lock.
+Provenance: ../ACKNOWLEDGEMENTS.md.
 """
 
 import os
@@ -26,9 +30,67 @@ from .constants import (
     CMD_ACCESS_REGISTER, AC_TRANSFER, AC_WRITE, AC_AARSIZE32, AC_POSTEXEC,
     CSR_DCSR, CSR_DPC, CSR_MSTATUS, MSTATUS_MIE, REG_GPR_BASE, PROGBUF0,
     DCSR_EBREAK_BITS, EBREAK,
+    CSR_MISA, MISA_EXT_S, MISA_EXT_U, MISA_EXT_H, XLEN,
+    CSR_TSELECT, CSR_TDATA1, CSR_TDATA2, CSR_TINFO,
+    CSR_TDATA1_TYPE_MASK,
+    CSR_TDATA1_TYPE_LEGACY, CSR_TDATA1_TYPE_MCONTROL,
+    CSR_TDATA1_TYPE_ICOUNT, CSR_TDATA1_TYPE_ITRIGGER, CSR_TDATA1_TYPE_ETRIGGER,
+    CSR_TDATA1_TYPE_MCONTROL6,
+    CSR_TINFO_VERSION_MASK,
+    CSR_MCONTROL_DMODE_MASK,
+    CSR_MCONTROL_MASKMAX_MASK,
+    CSR_MCONTROL_SIZELO_ANY, CSR_MCONTROL_ACTION_DEBUG_MODE, CSR_MCONTROL_ACTION_MASK,
+    CSR_MCONTROL_CHAIN_DISABLED, CSR_MCONTROL_CHAIN_ENABLED, CSR_MCONTROL_CHAIN_MASK,
+    CSR_MCONTROL_MATCH_MASK, CSR_MCONTROL_MATCH_EQUAL, CSR_MCONTROL_MATCH_NAPOT,
+    CSR_MCONTROL_MATCH_GE, CSR_MCONTROL_MATCH_LT,
+    CSR_MCONTROL_M_MASK, CSR_MCONTROL_S_MASK, CSR_MCONTROL_U_MASK,
+    CSR_MCONTROL_EXECUTE_MASK, CSR_MCONTROL_LOAD_MASK, CSR_MCONTROL_STORE_MASK,
+    CSR_MCONTROL_TYPE_MASK, CSR_MCONTROL_SIZELO_MASK, CSR_MCONTROL_SIZEHI_MASK,
+    CSR_MCONTROL6_DMODE_MASK, CSR_MCONTROL6_VS_MASK, CSR_MCONTROL6_VU_MASK,
+    CSR_MCONTROL6_SIZE_ANY, CSR_MCONTROL6_ACTION_DEBUG_MODE, CSR_MCONTROL6_ACTION_MASK,
+    CSR_MCONTROL6_CHAIN_DISABLED, CSR_MCONTROL6_CHAIN_ENABLED, CSR_MCONTROL6_CHAIN_MASK,
+    CSR_MCONTROL6_MATCH_MASK, CSR_MCONTROL6_MATCH_EQUAL, CSR_MCONTROL6_MATCH_NAPOT,
+    CSR_MCONTROL6_MATCH_GE, CSR_MCONTROL6_MATCH_LT,
+    CSR_MCONTROL6_M_MASK, CSR_MCONTROL6_S_MASK, CSR_MCONTROL6_U_MASK,
+    CSR_MCONTROL6_EXECUTE_MASK, CSR_MCONTROL6_LOAD_MASK, CSR_MCONTROL6_STORE_MASK,
+    CSR_MCONTROL6_TYPE_MASK, CSR_MCONTROL6_SIZE_MASK,
 )
 from . import chips
 from .transport import EspUsbJtagTransport
+
+# --- trigger-module return "codes" ------------------------------------------
+# OpenOCD's riscv.c trigger-setup functions (set_trigger, try_setup_*,
+# maybe_add_trigger_*, add_trigger) return a 3-way C int: ERROR_OK (0),
+# ERROR_TARGET_RESOURCE_NOT_AVAILABLE (this trigger/config doesn't work, try the
+# next one), or ERROR_FAIL (hard failure, abort). The actual numeric values live
+# in OpenOCD's jtag/error.h / target/target.h, which are NOT in our pinned
+# source bundle (only riscv.c + debug_defines.h were fetched) — porting the
+# exact integers would be re-deriving from memory, not transcribing from a
+# source we have. The 3-way branching the algorithm depends on IS upstream
+# logic and is kept exactly; only the representation changes (Python sentinels
+# instead of OpenOCD's int codes) — FAITHFUL-REIMPLEMENTATION.md's "port the
+# behavior, the mechanism may differ when the host language differs".
+ERROR_OK = None
+ERROR_TARGET_RESOURCE_NOT_AVAILABLE = "resource_not_available"
+ERROR_FAIL = "fail"
+ERROR_TARGET_NOT_HALTED = "target_not_halted"
+
+# get_field/set_field/field_value (target/register.h in upstream OpenOCD, not in
+# our pinned source bundle — these are generic bitfield macros, not RISC-V-
+# specific facts, so transcribing their trivial definitions here is not "porting
+# from memory": `get_field(reg, mask) = (reg & mask) >> trailing_zeros(mask)`.
+def _get_field(reg, mask):
+    return (reg & mask) >> ((mask & -mask).bit_length() - 1) if mask else 0
+
+
+def _set_field(reg, mask, value):
+    shift = (mask & -mask).bit_length() - 1 if mask else 0
+    return (reg & ~mask) | ((value << shift) & mask)
+
+
+def _field_value(mask, value):
+    shift = (mask & -mask).bit_length() - 1 if mask else 0
+    return (value << shift) & mask
 
 
 def _crc32_le_raw(data, crc=0):
@@ -411,6 +473,730 @@ class EspUsbJtag(EspUsbJtagTransport):
 
     def _chip(self):
         return chips.lookup(self.read_idcode()) or {}
+
+    # === RISC-V trigger module: watchpoints/breakpoints (hardware triggers) ===
+    # Ported from openocd-esp32 src/target/riscv/riscv.c @
+    # a585825d4d0bbd5b8aff83e01816d2f2c04ffd84 (2026-10-21), function-by-function,
+    # per docs/FAITHFUL-REIMPLEMENTATION.md. Types 3/4/5 (icount/itrigger/etrigger)
+    # and the CLI `reserve_trigger` feature are OUT OF SCOPE (#trigger-port) — only
+    # a `self.reserved_triggers` list (default all-False) is kept, since
+    # set_trigger's own reserved-trigger check is real upstream logic.
+    #
+    # Per-instance trigger state (OpenOCD's `struct riscv_info *r` fields),
+    # lazily populated by _enumerate_triggers() — mirrors how self._chip_dict /
+    # self.abits etc. are set lazily elsewhere in this file, not in __init__
+    # (the DM isn't up yet at construction time).
+    #   self.trigger_count            r->trigger_count
+    #   self.trigger_tinfo            r->trigger_tinfo[]   (list, len trigger_count)
+    #   self.trigger_unique_id        r->trigger_unique_id[] (list, -1 == free)
+    #   self.reserved_triggers        r->reserved_triggers[] (list, all False — #trigger-port scope)
+    #   self.triggers_enumerated      r->triggers_enumerated
+    #   self.tinfo_version            r->tinfo_version
+    #   self.wp_allow_napot_trigger   r->wp_allow_napot_trigger     (riscv.c:6135, default True)
+    #   self.wp_allow_ge_lt_trigger   r->wp_allow_ge_lt_trigger     (riscv.c:6134, default True)
+    #   self.wp_allow_equality_match_trigger  (riscv.c:6133, default True)
+    #   self._wp_triggers_negative_cache     r->wp_triggers_negative_cache[idx] -> {tdata1: {tdata2, ...}}
+    #   self._next_unique_id           espjtag addition: OpenOCD's trigger->unique_id
+    #                                   comes from the breakpoint/watchpoint object;
+    #                                   espjtag has no such object, so add_watchpoint()
+    #                                   hands out a monotonically increasing id itself.
+
+    @staticmethod
+    def _can_use_napot_match(address, length):
+        """can_use_napot_match (riscv.c:797). NAPOT needs a power-of-2 length > 1
+        and an address aligned to that length."""
+        size_power_of_2 = (length & (length - 1)) == 0
+        addr_aligned = (address & (length - 1)) == 0
+        return length > 1 and size_power_of_2 and addr_aligned
+
+    def _find_next_free_trigger(self, type_, chained, idx):
+        """find_next_free_trigger (riscv.c:807). Pure scan over
+        trigger_unique_id[]/trigger_tinfo[], no target I/O. Returns (ok, idx) —
+        the C signature returns the found index via an in/out pointer starting
+        the scan at *idx; we return it instead since Python has no out-param."""
+        num_found = 0
+        num_required = 2 if chained else 1
+        i = idx
+        while i < self.trigger_count:
+            if self.trigger_unique_id[i] == -1:
+                if self.trigger_tinfo[i] & (1 << type_):
+                    num_found += 1
+                    if num_required == num_found:
+                        return True, i - (num_required - 1)
+                    i += 1
+                    continue
+            # Trigger already occupied or incompatible type. Reset the counter.
+            num_found = 0
+            i += 1
+        return False, idx
+
+    def _find_first_trigger_by_id(self, unique_id):
+        """find_first_trigger_by_id (riscv.c:842). Pure scan."""
+        for i in range(self.trigger_count):
+            if self.trigger_unique_id[i] == unique_id:
+                return i
+        return -1
+
+    @staticmethod
+    def _count_trailing_ones(reg):
+        """count_trailing_ones (riscv.c:853). riscv_reg_t is 64-bit upstream
+        (XLEN<=64 always fits); espjtag is RV32-only so reg is masked to 32
+        bits by every caller — walk 32 bits, same as the C loop would for a
+        32-bit value held in a wider register."""
+        for i in range(XLEN):
+            if (1 & (reg >> i)) == 0:
+                return i
+        return XLEN
+
+    def _set_trigger(self, idx, tdata1, tdata2):
+        """set_trigger (riscv.c:863). THE core DMI sequence: select the trigger
+        via TSELECT, disable it (TDATA1=0), write TDATA2, write the real TDATA1,
+        read back TDATA1+TDATA2, and verify the hardware actually accepted the
+        config. Returns ERROR_OK (0) or an error string (truthy) — see the
+        ERROR_* constants below; the caller inspects both forms exactly like the
+        C caller inspects the int return.
+
+        DEVIATION (documented, not a port gap): the upstream
+        r->trigger_match_result_fixup hook (riscv.c:906-907) is an Espressif
+        per-chip-variant function pointer registered by target files NOT in our
+        pinned source bundle (only riscv.c + debug_defines.h were fetched) — it
+        is NULL on vanilla targets and espjtag has no equivalent mechanism, so
+        it is omitted rather than guessed at. See the trigger-support commit."""
+        assert idx < self.trigger_count
+        if self.reserved_triggers[idx]:
+            return ERROR_TARGET_RESOURCE_NOT_AVAILABLE
+
+        # Select which trigger to use
+        self.write_register(CSR_TSELECT, idx)
+
+        # Disable the trigger by writing 0 to it
+        self.write_register(CSR_TDATA1, 0)
+
+        # Set trigger data for tdata2 (tdata3 is out of scope — no type 3/4/5)
+        self.write_register(CSR_TDATA2, tdata2 & 0xFFFFFFFF)
+
+        # Set trigger data for tdata1
+        self.write_register(CSR_TDATA1, tdata1 & 0xFFFFFFFF)
+
+        # Read back tdata1, tdata2, and check if the configuration is supported
+        tdata1_rb = self.read_register(CSR_TDATA1)
+        tdata2_rb = self.read_register(CSR_TDATA2)
+
+        type_ = _get_field(tdata1, CSR_TDATA1_TYPE_MASK)
+        is_mcontrol = type_ == CSR_TDATA1_TYPE_MCONTROL
+
+        # Determine if tdata1 supports what we need. For mcontrol triggers, we
+        # don't care about the value in the read-only "maskmax" field.
+        tdata1_ignore_mask = CSR_MCONTROL_MASKMAX_MASK if is_mcontrol else 0
+        tdata1_config_denied = (tdata1 & ~tdata1_ignore_mask & 0xFFFFFFFF) != \
+            (tdata1_rb & ~tdata1_ignore_mask & 0xFFFFFFFF)
+
+        # Determine if tdata1.maskmax is sufficient (only relevant for mcontrol
+        # triggers and NAPOT match type)
+        unsupported_napot_range = False
+        maskmax_value = 0
+        if not tdata1_config_denied:
+            is_napot_match = _get_field(tdata1_rb, CSR_MCONTROL_MATCH_MASK) == \
+                CSR_MCONTROL_MATCH_NAPOT
+            if is_mcontrol and is_napot_match:
+                maskmax_value = _get_field(tdata1_rb, CSR_MCONTROL_MASKMAX_MASK)
+                napot_size = self._count_trailing_ones(tdata2) + 1
+                if maskmax_value < napot_size:
+                    unsupported_napot_range = True
+
+        tdata2_config_denied = (tdata2 & 0xFFFFFFFF) != tdata2_rb
+        if tdata1_config_denied or tdata2_config_denied or unsupported_napot_range:
+            self.write_register(CSR_TDATA1, 0)
+            return ERROR_TARGET_RESOURCE_NOT_AVAILABLE
+
+        return ERROR_OK
+
+    def _maybe_add_trigger_t1(self, address, length, is_read, is_write,
+                               is_execute, unique_id):
+        """maybe_add_trigger_t1 (riscv.c:952). Legacy type-1 trigger (`bpcontrol`,
+        pre-dates mcontrol). Not used by C3/C5/C6 (they report type 6) but small
+        enough to port for completeness, as instructed. `misa` is read live via
+        CSR_MISA (riscv_supports_extension equivalent — see the module docstring
+        on self.wp_allow_* for why espjtag reads this instead of caching r->misa
+        the way OpenOCD does)."""
+        bpcontrol_x = 1 << 0
+        bpcontrol_w = 1 << 1
+        bpcontrol_r = 1 << 2
+        bpcontrol_u = 1 << 3
+        bpcontrol_s = 1 << 4
+        bpcontrol_h = 1 << 5
+        bpcontrol_m = 1 << 6
+        bpcontrol_bpmatch = 0xF << 7
+        bpcontrol_bpaction = 0xFF << 11
+
+        idx = 0
+        ok, idx = self._find_next_free_trigger(CSR_TDATA1_TYPE_LEGACY, False, idx)
+        if not ok:
+            return ERROR_TARGET_RESOURCE_NOT_AVAILABLE
+
+        try:
+            tdata1 = self.read_register(CSR_TDATA1)
+        except RuntimeError:
+            return ERROR_FAIL
+        if tdata1 & (bpcontrol_r | bpcontrol_w | bpcontrol_x):
+            # Trigger is already in use, presumably by user code.
+            return ERROR_TARGET_RESOURCE_NOT_AVAILABLE
+
+        # DEVIATION: upstream uses the cached r->misa (populated during target
+        # examine, can't fail here); espjtag has no misa cache, so this is a live
+        # read that CAN raise — a new failure mode vs. upstream, treated the same
+        # as the TDATA1 read above (ERROR_FAIL) since there's no better upstream
+        # precedent for "misa unreadable" to match against.
+        try:
+            misa = self.read_register(CSR_MISA)
+        except RuntimeError:
+            return ERROR_FAIL
+        tdata1 = 0
+        tdata1 = _set_field(tdata1, bpcontrol_r, is_read)
+        tdata1 = _set_field(tdata1, bpcontrol_w, is_write)
+        tdata1 = _set_field(tdata1, bpcontrol_x, is_execute)
+        tdata1 = _set_field(tdata1, bpcontrol_u, bool(misa & MISA_EXT_U))
+        tdata1 = _set_field(tdata1, bpcontrol_s, bool(misa & MISA_EXT_S))
+        tdata1 = _set_field(tdata1, bpcontrol_h, bool(misa & MISA_EXT_H))
+        tdata1 = _set_field(tdata1, bpcontrol_m, 1)
+        tdata1 = _set_field(tdata1, bpcontrol_bpaction, 0)    # cause bp exception
+        tdata1 = _set_field(tdata1, bpcontrol_bpmatch, 0)     # exact match
+        tdata2 = address
+        ret = self._set_trigger(idx, tdata1, tdata2)
+        if ret != ERROR_OK:
+            return ret
+        self.trigger_unique_id[idx] = unique_id
+        return ERROR_OK
+
+    # --- trigger_request_info + the negative-result cache (riscv.c:999-1100) --
+    # The C version is a {tdata1, tdata2} struct + an intrusive linked-list cache
+    # keyed by trigger idx -> tdata1 -> {tdata2, ...} (tdata1_cache/tdata2_cache
+    # list_head chains, wp_triggers_negative_cache[idx]). Ported as PYTHON DICTS,
+    # not linked lists — FAITHFUL-REIMPLEMENTATION.md: "port the behavior, the
+    # mechanism may differ when the host language differs". The DATA STRUCTURE
+    # (nested map idx -> tdata1 -> set-of-tdata2) and its semantics (remember a
+    # (idx, tdata1, tdata2) combo that set_trigger rejected, so a repeat attempt
+    # skips re-probing hardware) are preserved exactly; the C list-splice-to-
+    # front "most recently used" reordering (wp_triggers_cache_add's
+    # list_move-to-tail on a hit) has no behavioral effect for a Python set
+    # membership test, so it is dropped (not ported) rather than faked with an
+    # OrderedDict for no observable benefit.
+
+    def _create_wp_trigger_cache(self):
+        """create_wp_trigger_cache (riscv.c:1045). calloc'd array of empty lists
+        in C; a dict of dicts here, one slot per trigger index."""
+        self._wp_triggers_negative_cache = [dict() for _ in range(self.trigger_count)]
+
+    def _wp_triggers_cache_add(self, idx, tdata1, tdata2):
+        """wp_triggers_cache_add (riscv.c:1055). Record that (tdata1, tdata2) is
+        NOT supported on trigger `idx`."""
+        tdata1_cache = self._wp_triggers_negative_cache[idx]
+        tdata1_cache.setdefault(tdata1, set()).add(tdata2)
+
+    def _wp_triggers_cache_search(self, idx, tdata1, tdata2):
+        """wp_triggers_cache_search (riscv.c:1073). True if (tdata1, tdata2) is
+        already known to be unsupported on trigger `idx`."""
+        tdata2_cache = self._wp_triggers_negative_cache[idx].get(tdata1)
+        if tdata2_cache is None:
+            return False
+        return tdata2 in tdata2_cache
+
+    def _try_use_trigger_and_cache_result(self, idx, tdata1, tdata2):
+        """try_use_trigger_and_cache_result (riscv.c:1088). Skip the hardware
+        probe if the cache already knows this (idx, tdata1, tdata2) fails;
+        otherwise probe via _set_trigger and memoize a negative result."""
+        if self._wp_triggers_cache_search(idx, tdata1, tdata2):
+            return ERROR_TARGET_RESOURCE_NOT_AVAILABLE
+        ret = self._set_trigger(idx, tdata1, tdata2)
+        if ret == ERROR_TARGET_RESOURCE_NOT_AVAILABLE:
+            self._wp_triggers_cache_add(idx, tdata1, tdata2)
+        return ret
+
+    def _try_setup_single_match_trigger(self, unique_id, tdata1, tdata2, log=None):
+        """try_setup_single_match_trigger (riscv.c:1102). Walk free triggers of
+        the right type, trying each until one accepts."""
+        if log:
+            log(f"  trying to set up a match trigger: tdata1={tdata1:#x} "
+                f"tdata2={tdata2:#x}")
+        trigger_type = _get_field(tdata1, CSR_MCONTROL_TYPE_MASK)
+        ret = ERROR_TARGET_RESOURCE_NOT_AVAILABLE
+        idx = 0
+        while True:
+            ok, idx = self._find_next_free_trigger(trigger_type, False, idx)
+            if not ok:
+                break
+            ret = self._try_use_trigger_and_cache_result(idx, tdata1, tdata2)
+            if ret == ERROR_OK:
+                self.trigger_unique_id[idx] = unique_id
+                return ERROR_OK
+            if ret != ERROR_TARGET_RESOURCE_NOT_AVAILABLE:
+                return ret
+            idx += 1
+        return ret
+
+    def _try_setup_chained_match_triggers(self, unique_id, t1, t2, log=None):
+        """try_setup_chained_match_triggers (riscv.c:1129). Pair-of-consecutive-
+        triggers variant for range watchpoints: tries idx/idx+1 together, undoing
+        idx if idx+1 fails but idx succeeded."""
+        if log:
+            log(f"  trying to set up a chain of match triggers: "
+                f"t1=({t1[0]:#x},{t1[1]:#x}) t2=({t2[0]:#x},{t2[1]:#x})")
+        trigger_type = _get_field(t1[0], CSR_MCONTROL_TYPE_MASK)
+        ret = ERROR_TARGET_RESOURCE_NOT_AVAILABLE
+        idx = 0
+        while True:
+            ok, idx = self._find_next_free_trigger(trigger_type, True, idx)
+            if not ok:
+                break
+            ret = self._try_use_trigger_and_cache_result(idx, t1[0], t1[1])
+            if ret == ERROR_TARGET_RESOURCE_NOT_AVAILABLE:
+                idx += 1
+                continue
+            if ret != ERROR_OK:
+                return ret
+
+            ret = self._try_use_trigger_and_cache_result(idx + 1, t2[0], t2[1])
+            if ret == ERROR_OK:
+                self.trigger_unique_id[idx] = unique_id
+                self.trigger_unique_id[idx + 1] = unique_id
+                return ERROR_OK
+            # Undo the setting of the previous trigger
+            ret_undo = self._set_trigger(idx, 0, 0)
+            if ret_undo != ERROR_OK:
+                return ret_undo
+            if ret != ERROR_TARGET_RESOURCE_NOT_AVAILABLE:
+                return ret
+            idx += 1
+        return ret
+
+    # --- match_triggers_tdata1_fields (riscv.c:1170-1274) ----------------------
+    # The C struct groups the tdata1 bits that are common to every match variant
+    # (common), the "any size" encoding (size.any), the chain enable/disable
+    # encodings (chain.enable/disable), and the four match-mode encodings
+    # (match.napot/lt/ge/eq) — all pre-OR'd field_value()s, assembled once per
+    # add_trigger() call and then combined by maybe_add_trigger_t2_t6_for_wp/bp.
+    # Ported as a dict with the same key names (common/size/chain/match), not a
+    # dataclass, to keep the field access (`fields["match"]["eq"]`) a direct
+    # transliteration of the C (`fields.match.eq`) — easy to diff against source.
+    #
+    # DEVIATION (documented): the upstream r->trigger_match_result_fixup hook
+    # (riscv.c:1227-1228, 1270-1271) is omitted here for the same reason as in
+    # _set_trigger — an Espressif per-chip extension point with no implementation
+    # in our pinned source bundle. tdata1_ignore_mask is therefore always 0 (its
+    # C default before the hook would run) — unused by the wp/bp callers below,
+    # which only reference .common/.size/.chain/.match, so this has no observable
+    # effect on the port; recorded for completeness per riscv.c's own struct shape.
+
+    def _fill_match_triggers_tdata1_fields_t2(self, is_execute, is_read, is_write):
+        """fill_match_triggers_tdata1_fields_t2 (riscv.c:1193). Type-2 (legacy
+        mcontrol) field composition. misa read live (see _maybe_add_trigger_t1)."""
+        misa = self.read_register(CSR_MISA)
+        return dict(
+            common=(
+                _field_value(CSR_MCONTROL_TYPE_MASK, CSR_TDATA1_TYPE_MCONTROL) |
+                _field_value(CSR_MCONTROL_DMODE_MASK, 1) |
+                _field_value(CSR_MCONTROL_ACTION_MASK, CSR_MCONTROL_ACTION_DEBUG_MODE) |
+                _field_value(CSR_MCONTROL_M_MASK, 1) |
+                _field_value(CSR_MCONTROL_S_MASK, bool(misa & MISA_EXT_S)) |
+                _field_value(CSR_MCONTROL_U_MASK, bool(misa & MISA_EXT_U)) |
+                _field_value(CSR_MCONTROL_EXECUTE_MASK, is_execute) |
+                _field_value(CSR_MCONTROL_LOAD_MASK, is_read) |
+                _field_value(CSR_MCONTROL_STORE_MASK, is_write)
+            ),
+            size=dict(any=_field_value(CSR_MCONTROL_SIZELO_MASK, CSR_MCONTROL_SIZELO_ANY & 3) |
+                           _field_value(CSR_MCONTROL_SIZEHI_MASK, (CSR_MCONTROL_SIZELO_ANY >> 2) & 3)),
+            chain=dict(enable=_field_value(CSR_MCONTROL_CHAIN_MASK, CSR_MCONTROL_CHAIN_ENABLED),
+                       disable=_field_value(CSR_MCONTROL_CHAIN_MASK, CSR_MCONTROL_CHAIN_DISABLED)),
+            match=dict(napot=_field_value(CSR_MCONTROL_MATCH_MASK, CSR_MCONTROL_MATCH_NAPOT),
+                       lt=_field_value(CSR_MCONTROL_MATCH_MASK, CSR_MCONTROL_MATCH_LT),
+                       ge=_field_value(CSR_MCONTROL_MATCH_MASK, CSR_MCONTROL_MATCH_GE),
+                       eq=_field_value(CSR_MCONTROL_MATCH_MASK, CSR_MCONTROL_MATCH_EQUAL)),
+            tdata1_ignore_mask=0,
+        )
+
+    def _fill_match_triggers_tdata1_fields_t6(self, is_execute, is_read, is_write):
+        """fill_match_triggers_tdata1_fields_t6 (riscv.c:1233). Type-6 (mcontrol6)
+        field composition — what C3/C5/C6 actually report. misa_h is read but, per
+        the C source, only used to gate VS/VU (requires both H and S/U — these
+        chips have no H extension, so VS/VU are always 0, same as upstream would
+        compute from their real misa)."""
+        misa = self.read_register(CSR_MISA)
+        misa_s = bool(misa & MISA_EXT_S)
+        misa_u = bool(misa & MISA_EXT_U)
+        misa_h = bool(misa & MISA_EXT_H)
+        return dict(
+            common=(
+                _field_value(CSR_MCONTROL6_TYPE_MASK, CSR_TDATA1_TYPE_MCONTROL6) |
+                _field_value(CSR_MCONTROL6_DMODE_MASK, 1) |
+                _field_value(CSR_MCONTROL6_ACTION_MASK, CSR_MCONTROL6_ACTION_DEBUG_MODE) |
+                _field_value(CSR_MCONTROL6_M_MASK, 1) |
+                _field_value(CSR_MCONTROL6_S_MASK, misa_s) |
+                _field_value(CSR_MCONTROL6_U_MASK, misa_u) |
+                _field_value(CSR_MCONTROL6_VS_MASK, misa_h and misa_s) |
+                _field_value(CSR_MCONTROL6_VU_MASK, misa_h and misa_u) |
+                _field_value(CSR_MCONTROL6_EXECUTE_MASK, is_execute) |
+                _field_value(CSR_MCONTROL6_LOAD_MASK, is_read) |
+                _field_value(CSR_MCONTROL6_STORE_MASK, is_write)
+            ),
+            size=dict(any=_field_value(CSR_MCONTROL6_SIZE_MASK, CSR_MCONTROL6_SIZE_ANY)),
+            chain=dict(enable=_field_value(CSR_MCONTROL6_CHAIN_MASK, CSR_MCONTROL6_CHAIN_ENABLED),
+                       disable=_field_value(CSR_MCONTROL6_CHAIN_MASK, CSR_MCONTROL6_CHAIN_DISABLED)),
+            match=dict(napot=_field_value(CSR_MCONTROL6_MATCH_MASK, CSR_MCONTROL6_MATCH_NAPOT),
+                       lt=_field_value(CSR_MCONTROL6_MATCH_MASK, CSR_MCONTROL6_MATCH_LT),
+                       ge=_field_value(CSR_MCONTROL6_MATCH_MASK, CSR_MCONTROL6_MATCH_GE),
+                       eq=_field_value(CSR_MCONTROL6_MATCH_MASK, CSR_MCONTROL6_MATCH_EQUAL)),
+            tdata1_ignore_mask=0,
+        )
+
+    def _maybe_add_trigger_t2_t6_for_wp(self, unique_id, address, length, fields, log=None):
+        """maybe_add_trigger_t2_t6_for_wp (riscv.c:1276). The real watchpoint
+        setup: NAPOT range match (if wp_allow_napot_trigger), then chained GE+LT
+        and LT+GE pairs (if wp_allow_ge_lt_trigger), then plain equality match
+        (if wp_allow_equality_match_trigger) — exact fallback order/conditions."""
+        ret = ERROR_TARGET_RESOURCE_NOT_AVAILABLE
+
+        if length > 0:
+            # Setting a load/store trigger ("watchpoint") on a range of addresses
+            if self._can_use_napot_match(address, length):
+                if self.wp_allow_napot_trigger:
+                    if log:
+                        log("  trying to setup NAPOT match trigger")
+                    napot_tdata1 = (fields["common"] | fields["size"]["any"] |
+                                     fields["chain"]["disable"] | fields["match"]["napot"])
+                    napot_tdata2 = address | ((length - 1) >> 1)
+                    ret = self._try_setup_single_match_trigger(
+                        unique_id, napot_tdata1, napot_tdata2, log=log)
+                    if ret != ERROR_TARGET_RESOURCE_NOT_AVAILABLE:
+                        return ret
+                elif log:
+                    log("  NAPOT match triggers are disabled for watchpoints.")
+
+            if self.wp_allow_ge_lt_trigger:
+                if log:
+                    log("  trying to setup GE+LT chained match trigger pair")
+                ge_1 = (fields["common"] | fields["size"]["any"] | fields["chain"]["enable"] |
+                        fields["match"]["ge"], address)
+                lt_2 = (fields["common"] | fields["size"]["any"] | fields["chain"]["disable"] |
+                        fields["match"]["lt"], address + length)
+                ret = self._try_setup_chained_match_triggers(unique_id, ge_1, lt_2, log=log)
+                if ret != ERROR_TARGET_RESOURCE_NOT_AVAILABLE:
+                    return ret
+
+                if log:
+                    log("  trying to setup LT+GE chained match trigger pair")
+                lt_1 = (fields["common"] | fields["size"]["any"] | fields["chain"]["enable"] |
+                        fields["match"]["lt"], address + length)
+                ge_2 = (fields["common"] | fields["size"]["any"] | fields["chain"]["disable"] |
+                        fields["match"]["ge"], address)
+                ret = self._try_setup_chained_match_triggers(unique_id, lt_1, ge_2, log=log)
+                if ret != ERROR_TARGET_RESOURCE_NOT_AVAILABLE:
+                    return ret
+            elif log:
+                log("  LT+GE chained match triggers are disabled for watchpoints.")
+
+        if self.wp_allow_equality_match_trigger:
+            if log:
+                log("  trying to setup equality match trigger")
+            eq_tdata1 = (fields["common"] | fields["size"]["any"] |
+                         fields["chain"]["disable"] | fields["match"]["eq"])
+            ret = self._try_setup_single_match_trigger(unique_id, eq_tdata1, address, log=log)
+            if ret != ERROR_OK:
+                return ret
+        elif log:
+            log("  equality match triggers are disabled for watchpoints.")
+
+        if ret == ERROR_OK and length > 1:
+            if not self.range_trigger_fallback_encountered:
+                # This message is displayed only once per target to avoid
+                # overwhelming the user with such messages on resume.
+                if log:
+                    log("  WARNING: could not set a trigger that will match a "
+                        "whole address range. As a fallback, this trigger (and "
+                        "maybe others) will only match against the first "
+                        "address of the range.")
+            self.range_trigger_fallback_encountered = True
+
+        return ret
+
+    def _maybe_add_trigger_t2_t6_for_bp(self, unique_id, address, fields, log=None):
+        """maybe_add_trigger_t2_t6_for_bp (riscv.c:1372). Breakpoint variant:
+        equality match only."""
+        if log:
+            log("  trying to setup equality match trigger")
+        eq_tdata1 = (fields["common"] | fields["size"]["any"] |
+                     fields["chain"]["disable"] | fields["match"]["eq"])
+        return self._try_setup_single_match_trigger(unique_id, eq_tdata1, address, log=log)
+
+    def _maybe_add_trigger_t2_t6(self, unique_id, address, length, is_read,
+                                  is_write, is_execute, fields, log=None):
+        """maybe_add_trigger_t2_t6 (riscv.c:1385). Dispatches bp vs wp based on
+        is_execute."""
+        if is_execute:
+            assert not is_read and not is_write
+            return self._maybe_add_trigger_t2_t6_for_bp(unique_id, address, fields, log=log)
+        assert is_read or is_write
+        return self._maybe_add_trigger_t2_t6_for_wp(unique_id, address, length, fields, log=log)
+
+    # --- trigger enumeration (riscv.c:6294-6447) --------------------------
+    # MUST run (and populate trigger_count/trigger_tinfo) before
+    # find_next_free_trigger is usable. Not in the "add a watchpoint" call path
+    # directly, but add_trigger() calls riscv_enumerate_triggers() first thing,
+    # exactly as upstream does — ported below as _enumerate_triggers().
+
+    def _check_if_trigger_exists(self, index):
+        """check_if_trigger_exists (riscv.c:6294). Write TSELECT=index, read it
+        back; if the hart doesn't support that many triggers, hardware clamps
+        tselect to a lower value and the readback won't match. A write failure
+        (can't select -> no trigger module) is RESOURCE_NOT_AVAILABLE; a READ
+        failure is the harder ERROR_FAIL (riscv.c:6300-6301) — distinct from a
+        clean "index out of range", so the caller must not treat them the same."""
+        try:
+            self.write_register(CSR_TSELECT, index)
+        except RuntimeError:
+            return ERROR_TARGET_RESOURCE_NOT_AVAILABLE
+        try:
+            tselect_rb = self.read_register(CSR_TSELECT)
+        except RuntimeError:
+            return ERROR_FAIL
+        # Mask off the top bit, used as tdrmode in legacy RISC-V Debug Spec (old
+        # v0.11 revisions). espjtag is RV32-only: top bit is bit 31.
+        tselect_rb &= ~(1 << (XLEN - 1)) & 0xFFFFFFFF
+        if tselect_rb != index:
+            return ERROR_TARGET_RESOURCE_NOT_AVAILABLE
+        return ERROR_OK
+
+    def _get_trigger_types(self, tdata1):
+        """get_trigger_types (riscv.c:6315). Reads tinfo to determine supported
+        trigger types for the currently-selected trigger; if reading tinfo FAILS
+        (abstract cmderr -> our read_register raises, mirroring riscv_reg_get
+        returning != ERROR_OK), falls back to deriving a single-type bitmask from
+        tdata1's own type field. Returns (ret, trigger_tinfo)."""
+        try:
+            tinfo = self.read_register(CSR_TINFO)
+        except RuntimeError:
+            type_ = _get_field(tdata1, CSR_TDATA1_TYPE_MASK)
+            if type_ == 0:
+                return ERROR_TARGET_RESOURCE_NOT_AVAILABLE, None
+            return ERROR_OK, 1 << type_
+        # tinfo.INFO == 1: trigger doesn't exist. tinfo == 0 or LSB set: invalid.
+        if tinfo == 0 or tinfo & 0x1:
+            return ERROR_TARGET_RESOURCE_NOT_AVAILABLE, None
+        return ERROR_OK, tinfo
+
+    def _disable_trigger_if_dmode(self, tdata1):
+        """disable_trigger_if_dmode (riscv.c:6335). If the currently-selected
+        trigger (already selected by the caller) has dmode set, it was left
+        armed by a previous/killed debug session — disable it (write TDATA1=0)."""
+        type_ = _get_field(tdata1, CSR_TDATA1_TYPE_MASK)
+        dmode_is_set = False
+        if type_ == CSR_TDATA1_TYPE_LEGACY:
+            # On these older cores we don't support software using triggers.
+            dmode_is_set = True
+        elif type_ == CSR_TDATA1_TYPE_MCONTROL:
+            dmode_is_set = bool(tdata1 & CSR_MCONTROL_DMODE_MASK)
+        elif type_ == CSR_TDATA1_TYPE_MCONTROL6:
+            dmode_is_set = bool(tdata1 & CSR_MCONTROL6_DMODE_MASK)
+        elif type_ in (CSR_TDATA1_TYPE_ICOUNT, CSR_TDATA1_TYPE_ITRIGGER,
+                       CSR_TDATA1_TYPE_ETRIGGER):
+            # Types 3/4/5 (icount/itrigger/etrigger) are out of scope
+            # (#trigger-port) — espjtag never SETS these, but if a hart reports
+            # one already dmode-armed (leftover from another debugger), it must
+            # still be disabled like upstream does. dmode bit is at the same
+            # DMODE_OFFSET=(XLEN-5) for every trigger type per the debug spec,
+            # so reuse CSR_MCONTROL_DMODE_MASK rather than add unused per-type
+            # dmode constants for types this port never constructs.
+            dmode_is_set = bool(tdata1 & CSR_MCONTROL_DMODE_MASK)
+        if not dmode_is_set:
+            return ERROR_OK
+        self.write_register(CSR_TDATA1, 0)
+        return ERROR_OK
+
+    def _enumerate_triggers(self, log=None):
+        """riscv_enumerate_triggers (riscv.c:6373). Count triggers and populate
+        trigger_tinfo for each; idempotent (triggers_enumerated guard). Disables
+        any hardware trigger left with dmode set (maybe from a killed session).
+        The hart MUST be halted — enforced below (riscv.c:6380-6383), not just
+        documented: CSR access on a running hart is undefined/may silently read
+        garbage rather than cleanly erroring, so this is checked BEFORE any
+        register I/O, exactly where upstream checks it."""
+        if getattr(self, "triggers_enumerated", False):
+            return ERROR_OK
+
+        if not (self.dm_read(DMSTATUS) & DM_ALLHALTED):
+            if log:
+                log("  unable to enumerate triggers: target not halted")
+            return ERROR_TARGET_NOT_HALTED
+
+        chips.require_riscv(self.read_idcode(), op="trigger enumeration")
+
+        # trigger-module instance state, lazily created here (see the class-level
+        # doc block above _can_use_napot_match for the full field list).
+        self.wp_allow_napot_trigger = True             # riscv.c:6135
+        self.wp_allow_ge_lt_trigger = True              # riscv.c:6134
+        self.wp_allow_equality_match_trigger = True     # riscv.c:6133
+        self.range_trigger_fallback_encountered = False
+
+        try:
+            orig_tselect = self.read_register(CSR_TSELECT)
+        except RuntimeError:
+            # If tselect is not readable, the trigger module is likely not
+            # implemented.
+            if log:
+                log("  cannot access tselect register; assuming triggers are "
+                    "not implemented")
+            self.triggers_enumerated = True
+            self.trigger_count = 0
+            self.trigger_tinfo = []
+            self.trigger_unique_id = []
+            self.reserved_triggers = []
+            return ERROR_OK
+
+        # Obtaining tinfo.version value once. No need to enumerate per-trigger.
+        try:
+            tinfo = self.read_register(CSR_TINFO)
+            self.tinfo_version = _get_field(tinfo, CSR_TINFO_VERSION_MASK)
+        except RuntimeError:
+            self.tinfo_version = None       # RISCV_TINFO_VERSION_UNKNOWN
+
+        trigger_tinfo = []
+        # ARRAY_SIZE(r->trigger_tinfo) upstream is a fixed-size C array
+        # (RISCV_MAX_TRIGGERS); Python has no such static bound, so the loop
+        # just runs until check_if_trigger_exists/get_trigger_types says stop
+        # (#trigger-port: "Python not having C's static-array size limit").
+        t = 0
+        while True:
+            result = self._check_if_trigger_exists(t)
+            if result == ERROR_FAIL:
+                return ERROR_FAIL
+            if result == ERROR_TARGET_RESOURCE_NOT_AVAILABLE:
+                break
+
+            try:
+                tdata1 = self.read_register(CSR_TDATA1)
+            except RuntimeError:
+                return ERROR_FAIL
+
+            result, tinfo_t = self._get_trigger_types(tdata1)
+            if result == ERROR_FAIL:
+                return ERROR_FAIL
+            if result == ERROR_TARGET_RESOURCE_NOT_AVAILABLE:
+                break
+            trigger_tinfo.append(tinfo_t)
+
+            if log:
+                log(f"  trigger {t}: supported types (mask) = {tinfo_t:#010x}")
+
+            if self._disable_trigger_if_dmode(tdata1) != ERROR_OK:
+                return ERROR_FAIL
+            t += 1
+
+        try:
+            self.write_register(CSR_TSELECT, orig_tselect)
+        except RuntimeError:
+            return ERROR_FAIL
+
+        self.triggers_enumerated = True
+        self.trigger_count = t
+        self.trigger_tinfo = trigger_tinfo
+        self.trigger_unique_id = [-1] * t
+        if log:
+            log(f"  found {t} triggers")
+        self.reserved_triggers = [False] * t         # #trigger-port: no CLI reserve feature
+        self._create_wp_trigger_cache()
+        return ERROR_OK
+
+    # --- add_trigger (riscv.c:1494) — the top-level entry point ----------------
+
+    def _add_trigger(self, address, length, is_read, is_write, is_execute,
+                      unique_id, log=None):
+        """add_trigger (riscv.c:1494). Enumerate triggers, try type 1 then type 2
+        then type 6 (in that order, matching upstream's `do { } while(0)` chain),
+        restore tselect afterwards regardless of outcome."""
+        ret = self._enumerate_triggers(log=log)
+        if ret != ERROR_OK:
+            return ret
+
+        try:
+            tselect = self.read_register(CSR_TSELECT)
+        except RuntimeError:
+            return ERROR_FAIL
+
+        ret = self._maybe_add_trigger_t1(address, length, is_read, is_write,
+                                          is_execute, unique_id)
+        if ret != ERROR_OK:
+            fields_t2 = self._fill_match_triggers_tdata1_fields_t2(
+                is_execute, is_read, is_write)
+            ret = self._maybe_add_trigger_t2_t6(
+                unique_id, address, length, is_read, is_write, is_execute,
+                fields_t2, log=log)
+            if ret != ERROR_OK:
+                fields_t6 = self._fill_match_triggers_tdata1_fields_t6(
+                    is_execute, is_read, is_write)
+                ret = self._maybe_add_trigger_t2_t6(
+                    unique_id, address, length, is_read, is_write, is_execute,
+                    fields_t6, log=log)
+
+        # riscv.c:1521-1523: a TSELECT-restore failure only overrides `ret` when
+        # the attempt above had otherwise succeeded — a genuine setup failure
+        # keeps its own error code even if the restore also fails.
+        try:
+            self.write_register(CSR_TSELECT, tselect)
+        except RuntimeError:
+            if ret == ERROR_OK:
+                return ERROR_FAIL
+        return ret
+
+    # --- public API --------------------------------------------------------
+
+    def add_watchpoint(self, address, length=4, is_read=False, is_write=True, log=None):
+        """Set a hardware watchpoint on [address, address+length) — a load/store
+        trigger via the RISC-V trigger module (riscv.c add_trigger, ported
+        above). The hart MUST be halted first (call halt()). Tries, in order:
+        a NAPOT range match, a chained GE+LT/LT+GE trigger pair, then a plain
+        equality match on `address` alone (watch_allow_* flags, all default
+        True) — the exact upstream fallback chain. Returns a watchpoint handle
+        (opaque int) to pass to remove_watchpoint(), or raises RuntimeError if
+        no free/compatible trigger was found."""
+        if not is_read and not is_write:
+            raise ValueError("add_watchpoint: at least one of is_read/is_write required")
+        unique_id = getattr(self, "_next_unique_id", 0)
+        self._next_unique_id = unique_id + 1
+        ret = self._add_trigger(address, length, is_read, is_write, False,
+                                 unique_id, log=log)
+        if ret != ERROR_OK:
+            raise RuntimeError(
+                f"add_watchpoint: no trigger available for addr=0x{address:08x} "
+                f"length={length} read={is_read} write={is_write} (ret={ret})")
+        return unique_id
+
+    def add_breakpoint(self, address, log=None):
+        """Set a hardware (trigger-module) breakpoint at `address` — an execute
+        trigger via add_trigger. The hart MUST be halted first. Returns a handle
+        for remove_watchpoint(), or raises RuntimeError if unavailable."""
+        unique_id = getattr(self, "_next_unique_id", 0)
+        self._next_unique_id = unique_id + 1
+        ret = self._add_trigger(address, 0, False, False, True, unique_id, log=log)
+        if ret != ERROR_OK:
+            raise RuntimeError(
+                f"add_breakpoint: no trigger available for addr=0x{address:08x} "
+                f"(ret={ret})")
+        return unique_id
+
+    def remove_watchpoint(self, handle):
+        """Clear every trigger carrying `handle` (the id returned by
+        add_watchpoint()/add_breakpoint() — a chained range watchpoint occupies
+        two). Not a literal upstream function (OpenOCD's remove path is spread
+        across target.c breakpoint/watchpoint bookkeeping this port doesn't
+        carry); same effect expressed directly against trigger_unique_id[]."""
+        if not getattr(self, "triggers_enumerated", False):
+            return 0
+        cleared = 0
+        for idx in range(self.trigger_count):
+            if self.trigger_unique_id[idx] == handle:
+                self._set_trigger(idx, 0, 0)
+                self.trigger_unique_id[idx] = -1
+                cleared += 1
+        return cleared
 
     def call_rom(self, sym, args=(), restore=True):
         """Call a named ROM function from this chip's chips.rom table (e.g.
