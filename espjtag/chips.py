@@ -15,6 +15,12 @@ Each entry carries:
   rom         per-chip ROM symbol addresses for the flash loader (#3) — the
               esp_rom_spiflash_* entry points + cache control (from <soc>.rom.ld)
   reset       SoC reset registers for reset_run_from_rom (the LP_AON SW-reset regs)
+  bootloader_offset  flash byte-offset of the 2nd-stage bootloader header (the
+              0xE9 image-magic _rom_flash_ready() gate reads here) — PER CHIP,
+              not always 0. Source: ESP-IDF components/bootloader/Kconfig.projbuild
+              BOOTLOADER_OFFSET_IN_FLASH: default 0x1000 for ESP32/ESP32-S2,
+              0x2000 for ESP32-P4/C5/H4, 0x0 for everything else (espjtag#55).
+              Omitted entries fall back to 0x0 (the Kconfig default).
   flash_xip   the cache-mapped flash window base (SBA can't read it — use progbuf)
   sram        a scratch SRAM window {data, stack, trap} the flash loader stages
               args/buffer/return-trap into while the hart is HALTED (#3)
@@ -160,6 +166,12 @@ CHIPS = {
         abits=10,
         chain=_C5_TWO_TAP,
         flash_xip=0x42000000,
+        # VERIFIED live (espjtag#55): flash_read_rom(0x2000, 4) found the real 0xE9
+        # bootloader magic; offset 0x0 is blank/erased (cross-checked independently
+        # via `esptool read-flash`). Matches ESP-IDF's own default — Source:
+        # components/bootloader/Kconfig.projbuild BOOTLOADER_OFFSET_IN_FLASH,
+        # "default 0x2000 if IDF_TARGET_ESP32P4 || IDF_TARGET_ESP32C5 || IDF_TARGET_ESP32H4".
+        bootloader_offset=0x2000,
         # ROM SPI-flash helpers (esp32c5.rom.ld). The C5's cache uses a NEWER API
         # (no simple Cache_Disable_ICache), so no icache toggle is tabled — the ROM
         # read runs with the hart halted, so there's no prefetch racing it (the
@@ -340,6 +352,14 @@ def sram_for(idcode):
     """The scratch-SRAM window dict for the flash loader, or None if not tabled."""
     e = lookup(idcode)
     return e.get("sram") if e else None
+
+
+def bootloader_offset_for(idcode):
+    """Flash byte-offset of the 2nd-stage bootloader header (espjtag#55). Defaults
+    to 0x0 for an unlisted chip or an entry with no override — the ESP-IDF Kconfig
+    default (see CHIPS docstring); only P4/C5/H4 override to 0x2000."""
+    e = lookup(idcode)
+    return (e.get("bootloader_offset", 0x0) if e else 0x0)
 
 
 def is_riscv(idcode):
